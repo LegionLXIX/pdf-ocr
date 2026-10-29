@@ -3,10 +3,10 @@
 __pycache__/
 *.pyc
 
-# generated per machine: icon files, launcher exe, personal artwork
-icon.ico
-icon.png
-icon_source.png
+# generated per machine: icon files, launcher exe, personal artwork (docs/icon.png is the committed preview)
+/icon.ico
+/icon.png
+/icon_source.png
 launcher_ok.txt
 
 # local data
