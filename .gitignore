@@ -1,0 +1,14 @@
+# virtual environment (5 GB; rebuild with: py -3.12 -m venv .venv && .venv\Scripts\python -m pip install -r requirements.txt)
+.venv/
+__pycache__/
+*.pyc
+
+# generated per machine: icon files, launcher exe, personal artwork
+icon.ico
+icon.png
+icon_source.png
+launcher_ok.txt
+
+# local data
+*.db
+*.log
