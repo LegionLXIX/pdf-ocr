@@ -52,7 +52,10 @@ a new `ICON_NAME` in `make_icon.py` and run `register.py` again, or the old icon
 
 ## How it works
 
-- **Viewer**: continuous scroll, Ctrl+wheel or +/− to zoom, thumbnails on the left, PgUp/PgDn, page box.
+- **Viewer**: continuous scroll, Ctrl+wheel or +/− to zoom, thumbnails on the left, page box.
+  ←/→ and PgUp/PgDn step a page, ↑/↓ scroll, Home/End jump to the first/last page (click the page
+  first so it has keyboard focus). Pages render at the screen's real pixel density, so they stay sharp
+  on HiDPI / scaled displays.
   *Fit width* (Ctrl+1) and *Fit page* (Ctrl+0, whole page visible) keep re-fitting as you resize the
   window until you zoom manually.
 - **Text selection**: the default tool is *Select text* (T): drag over words, double-click a word,

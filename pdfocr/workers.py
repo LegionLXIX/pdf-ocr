@@ -1,6 +1,7 @@
 """Background threads: OCR jobs, document search, folder indexing."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pymupdf
@@ -9,6 +10,8 @@ from PySide6.QtCore import QThread, Signal
 from .library import Library
 from .ocr_engine import OcrEngine
 from .pdf_ocr import ocr_pdf, output_path_for, page_has_text
+from .pdflock import LOCK
+from .textutil import clean_line
 
 _engine: OcrEngine | None = None
 
@@ -58,7 +61,7 @@ class OcrWorker(QThread):
 
 class DocSearchWorker(QThread):
     """Find every occurrence of `query` in an open document."""
-    hit = Signal(int, object, str)   # page, rect, context
+    hit = Signal(int, object, str)   # page, list of rects (one per line the match spans), context
     done = Signal(int)
 
     def __init__(self, path: str, query: str):
@@ -73,29 +76,65 @@ class DocSearchWorker(QThread):
         count = 0
         q = self.query
         ql = q.lower()
-        with pymupdf.open(self.path) as doc:
+        with LOCK:
+            doc = pymupdf.open(self.path)
+        with doc:
             for i in range(doc.page_count):
                 if self._cancel:
                     break
-                page = doc[i]
-                rects = page.search_for(q)
+                with LOCK:   # one page at a time, so the renderer and GUI thread get turns in between
+                    page = doc[i]
+                    rects = page.search_for(q)
+                    text = clean_line(page.get_text()) if rects else ""
                 if not rects:
                     continue
-                text = " ".join(page.get_text().split())
                 tl = text.lower()
-                pos = 0
-                for r in rects:
-                    k = tl.find(ql, pos)
-                    if k < 0:
-                        k = tl.find(ql)
-                    if k >= 0:
-                        ctx = text[max(0, k - 50): k + len(q) + 60]
-                        pos = k + len(q)
-                    else:
-                        ctx = ""
-                    self.hit.emit(i, r, ("…" if k > 50 else "") + ctx + "…")
+                positions = [m.start() for m in re.finditer(re.escape(ql), tl)]
+                for k, group in zip(positions, _group_rects(rects, len(positions))):
+                    # start at a word boundary a little before the match, keep it to about two lines
+                    start = max(0, k - 40)
+                    if start > 0:
+                        sp = text.rfind(" ", start, k)
+                        start = sp + 1 if sp >= 0 else start
+                    end = k + len(q) + 70
+                    ctx = ("…" if start > 0 else "") + text[start:end] + ("…" if end < len(text) else "")
+                    self.hit.emit(i, group, ctx)
                     count += 1
         self.done.emit(count)
+
+
+def _group_rects(rects: list, n: int) -> list[list]:
+    """Group MuPDF's per-line hit rectangles into `n` matches. A match that wraps onto the next line
+    comes back as two short rects; merge the `extra` most likely pairs (next line down, smallest
+    combined width) so each match keeps all of its highlight boxes."""
+    if n <= 0:
+        return []
+    if len(rects) <= n:
+        groups = [[r] for r in rects]
+        return groups + [groups[-1]] * (n - len(groups)) if groups else [[]] * n
+    extra = len(rects) - n
+    cands = []
+    for j in range(len(rects) - 1):
+        a, b = rects[j], rects[j + 1]
+        if b.y0 >= a.y0 + 0.5 * a.height:   # b is on a lower line than a
+            cands.append((a.width + b.width, j))
+    merge = set()
+    for _, j in sorted(cands):
+        if len(merge) >= extra:
+            break
+        if j - 1 not in merge and j + 1 not in merge:
+            merge.add(j)
+    groups, j = [], 0
+    while j < len(rects):
+        if j in merge:
+            groups.append([rects[j], rects[j + 1]])
+            j += 2
+        else:
+            groups.append([rects[j]])
+            j += 1
+    while len(groups) > n:          # couldn't pair enough: fold leftovers into their neighbour
+        groups[-2].extend(groups.pop())
+    return groups
 
 
 class IndexWorker(QThread):

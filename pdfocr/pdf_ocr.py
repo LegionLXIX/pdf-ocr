@@ -17,6 +17,7 @@ import pymupdf
 from PIL import Image
 
 from .ocr_engine import OcrEngine, PageOcr, SKIP_LABELS
+from .pdflock import LOCK
 
 DEFAULT_DPI = 200
 BATCH = 4  # pages per OCR call; the 4090 has room for more but this keeps progress responsive
@@ -96,14 +97,15 @@ def ocr_pdf(
     src = Path(src)
     dst = Path(dst) if dst else output_path_for(src)
     engine = engine or OcrEngine()
-    doc = pymupdf.open(src)
-    todo = list(pages) if pages is not None else list(range(doc.page_count))
-    if not force:
-        todo = [i for i in todo if not page_has_text(doc[i])]
-    texts = [""] * doc.page_count
-    for i in range(doc.page_count):
-        if i not in todo:
-            texts[i] = doc[i].get_text()
+    with LOCK:
+        doc = pymupdf.open(src)
+        todo = list(pages) if pages is not None else list(range(doc.page_count))
+        if not force:
+            todo = [i for i in todo if not page_has_text(doc[i])]
+        texts = [""] * doc.page_count
+        for i in range(doc.page_count):
+            if i not in todo:
+                texts[i] = doc[i].get_text()
 
     if progress:
         progress(0, len(todo), "Loading OCR models…")
@@ -111,27 +113,31 @@ def ocr_pdf(
     done = 0
     for start in range(0, len(todo), BATCH):
         if cancelled and cancelled():
-            doc.close()
+            with LOCK:
+                doc.close()
             raise InterruptedError("OCR cancelled")
         batch = todo[start:start + BATCH]
-        rendered = [render_page(doc[i], dpi) for i in batch]
-        results = engine.ocr_images([im for im, _ in rendered])
-        for i, (im, mat), res in zip(batch, rendered, results):
-            write_text_layer(doc[i], res, mat)
-            texts[i] = res.text
-            done += 1
+        with LOCK:
+            rendered = [render_page(doc[i], dpi) for i in batch]
+        results = engine.ocr_images([im for im, _ in rendered])   # GPU work, outside the lock
+        with LOCK:
+            for i, (im, mat), res in zip(batch, rendered, results):
+                write_text_layer(doc[i], res, mat)
+                texts[i] = res.text
+                done += 1
         if progress:
             progress(done, len(todo), f"Page {batch[-1] + 1} of {doc.page_count}")
 
-    if todo:
-        meta = dict(doc.metadata or {})
-        kw = meta.get("keywords") or ""
-        if OCR_MARKER not in kw:
-            meta["keywords"] = (kw + " " + OCR_MARKER).strip()
-        doc.set_metadata({k: v for k, v in meta.items() if k not in ("format", "encryption")})
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        doc.save(dst, garbage=1, deflate=True)
-    doc.close()
+    with LOCK:
+        if todo:
+            meta = dict(doc.metadata or {})
+            kw = meta.get("keywords") or ""
+            if OCR_MARKER not in kw:
+                meta["keywords"] = (kw + " " + OCR_MARKER).strip()
+            doc.set_metadata({k: v for k, v in meta.items() if k not in ("format", "encryption")})
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            doc.save(dst, garbage=1, deflate=True)
+        doc.close()
     return dst, len(todo), texts
 
 

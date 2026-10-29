@@ -9,6 +9,8 @@ from pathlib import Path
 import pymupdf
 
 from .pdf_ocr import MIN_TEXT_CHARS, is_ocr_done, output_path_for
+from .pdflock import LOCK
+from .textutil import clean_text
 
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "PDF OCR"
 DB_PATH = APP_DIR / "library.db"
@@ -53,10 +55,11 @@ class Library:
     def index_pdf(self, path: Path, texts: list[str] | None = None) -> DocStatus:
         """Store the text of every page. `texts` lets the OCR step pass what it already extracted."""
         path = Path(path)
-        with pymupdf.open(path) as doc:
+        with LOCK, pymupdf.open(path) as doc:
             done = is_ocr_done(doc)
             if texts is None:
                 texts = [doc[i].get_text() for i in range(doc.page_count)]
+        texts = [clean_text(t) for t in texts]
         text_pages = len(texts) if done else sum(1 for t in texts if len(t.strip()) >= MIN_TEXT_CHARS)
         with self.db:
             self.db.execute("DELETE FROM pages WHERE doc_id IN (SELECT id FROM docs WHERE path=?)", (str(path),))

@@ -10,10 +10,13 @@ from PySide6.QtCore import QSettings, Qt, QTimer, QSize
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QIcon
 from PySide6.QtWidgets import (QApplication, QDialog, QDockWidget, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-                               QRadioButton, QSpinBox, QToolBar, QVBoxLayout, QWidget, QStyle, QFrame, QTextBrowser)
+                               QRadioButton, QSpinBox, QToolBar, QToolButton, QVBoxLayout, QWidget, QStyle, QFrame,
+                               QTextBrowser)
 
 from .library import Library, LibraryHit
 from .pdf_ocr import output_path_for, pages_needing_ocr
+from .pdflock import LOCK
+from .results import HEADER_ROLE, PAGE_ROLE, SNIPPET_ROLE, ResultDelegate
 from .viewer import PdfView, ThumbnailList
 from .workers import DocSearchWorker, IndexWorker, OcrWorker
 
@@ -57,8 +60,11 @@ class SearchPanel(QWidget):
         self.this_doc.setChecked(True)
         self.count = QLabel("")
         self.results = QListWidget()
-        self.results.setWordWrap(True)
-        self.results.setAlternatingRowColors(True)
+        self.results.setItemDelegate(ResultDelegate(self.results, lambda: self.edit.text().strip()))
+        self.results.setMouseTracking(True)
+        self.results.setSpacing(0)
+        self.results.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.results.setFrameShape(QFrame.Shape.NoFrame)
         self.prev = QPushButton("◀ Prev")
         self.next = QPushButton("Next ▶")
         nav = QHBoxLayout()
@@ -142,12 +148,24 @@ class MainWindow(QMainWindow):
         self.info_label = QLabel("")
         self.info_btn = QPushButton("Make searchable (OCR)")
         self.info_btn.clicked.connect(self.ocr_current)
+        self.info_close = QToolButton()
+        self.info_close.setText("✕")
+        self.info_close.setToolTip("Hide this notice for this document (the toolbar's OCR button still works)")
+        self.info_close.setAutoRaise(True)
+        self.info_close.setStyleSheet("QToolButton{color:#000;font-size:14px;padding:2px 6px}")
+        self.info_close.clicked.connect(self._dismiss_infobar)
+        self._infobar_dismissed: set[str] = set()   # document paths whose notice was closed this session
         il.addWidget(self.info_label, 1)
         il.addWidget(self.info_btn)
+        il.addWidget(self.info_close)
         self.infobar.hide()
         lay.addWidget(self.infobar)
         lay.addWidget(central, 1)
         return wrap
+
+    def _dismiss_infobar(self):
+        self._infobar_dismissed.add(self.doc_path)
+        self.infobar.hide()
 
     def _build_toolbar(self):
         tb = QToolBar("Main")
@@ -282,20 +300,22 @@ class MainWindow(QMainWindow):
         if not p.exists():
             QMessageBox.warning(self, APP_NAME, f"File not found:\n{p}")
             return
-        try:
-            doc = pymupdf.open(p)
-        except Exception as e:
-            QMessageBox.critical(self, APP_NAME, f"Could not open PDF:\n{e}")
-            return
-        # Prefer the OCR'd sibling of a scan the user double-clicked
-        ocr_sibling = output_path_for(p)
-        if ocr_sibling.exists() and p != ocr_sibling and pages_needing_ocr(doc):
-            doc.close()
-            doc = pymupdf.open(ocr_sibling)
-            p = ocr_sibling
-            self.statusBar().showMessage(f"Opened the OCR'd copy: {p.name}", 6000)
-        if self.doc:
-            self.doc.close()
+        with LOCK:
+            try:
+                doc = pymupdf.open(p)
+            except Exception as e:
+                QMessageBox.critical(self, APP_NAME, f"Could not open PDF:\n{e}")
+                return
+            # Prefer the OCR'd sibling of a scan the user double-clicked
+            ocr_sibling = output_path_for(p)
+            if ocr_sibling.exists() and p != ocr_sibling and pages_needing_ocr(doc):
+                doc.close()
+                doc = pymupdf.open(ocr_sibling)
+                p = ocr_sibling
+                self.statusBar().showMessage(f"Opened the OCR'd copy: {p.name}", 6000)
+            if self.doc:
+                self.doc.close()
+            missing = pages_needing_ocr(doc)
         self.doc, self.doc_path = doc, str(p)
         self.setWindowTitle(f"{p.name} — {APP_NAME}")
         self.settings.setValue("last_dir", str(p.parent))
@@ -310,11 +330,12 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self.view.fit_width)
         if page:
             QTimer.singleShot(50, lambda: self.view.go_to_page(page))
-        missing = pages_needing_ocr(doc)
-        if missing:
+        self.view.setFocus()   # arrow keys page through the document right away
+        if missing and str(p) not in self._infobar_dismissed:
             n = len(missing)
             self.info_label.setText(
-                f"{n} of {doc.page_count} pages have no text layer, so they can't be searched yet.")
+                f"{n} of {doc.page_count} pages {'have' if n != 1 else 'has'} no text layer, "
+                f"so {'they' if n != 1 else 'it'} can't be searched yet.")
             self.infobar.show()
         else:
             self.infobar.hide()
@@ -392,10 +413,12 @@ class MainWindow(QMainWindow):
         self.search_worker.done.connect(self._on_search_done)
         self.search_worker.start()
 
-    def _on_hit(self, page: int, rect, ctx: str):
-        self.hits.append((page, rect))
+    def _on_hit(self, page: int, rects, ctx: str):
+        self.hits.append((page, rects))
         item = QListWidgetItem(f"p. {page + 1}   {ctx}")
         item.setData(Qt.ItemDataRole.UserRole, len(self.hits) - 1)
+        item.setData(PAGE_ROLE, page)
+        item.setData(SNIPPET_ROLE, ctx)
         self.search.results.addItem(item)
         if len(self.hits) == 1:
             self.view.set_hits(self.hits, 0)
@@ -405,7 +428,9 @@ class MainWindow(QMainWindow):
         self.view.set_hits(self.hits, self.current_hit)
         if count == 0:
             msg = "No matches."
-            if self.doc and pages_needing_ocr(self.doc):
+            with LOCK:
+                needs = bool(self.doc and pages_needing_ocr(self.doc))
+            if needs:
                 msg += "  Some pages have no text layer — run OCR."
             self.search.count.setText(msg)
         else:
@@ -424,9 +449,12 @@ class MainWindow(QMainWindow):
                 self.view.go_to_page(data.page)
             return
         self.current_hit = data
-        page, rect = self.hits[data]
+        page, rects = self.hits[data]
         self.view.set_current_hit(data)
-        self.view.go_to_page(page, rect)
+        self.view.go_to_page(page, rects[0])
+        if not (self.search_worker and self.search_worker.isRunning()):
+            n = len(self.hits)
+            self.search.count.setText(f"{data + 1} of {n} match{'es' if n != 1 else ''}")
 
     def step_hit(self, delta: int):
         n = self.search.results.count()
@@ -448,13 +476,13 @@ class MainWindow(QMainWindow):
             if h.path != last:
                 hdr = QListWidgetItem(Path(h.path).stem)
                 hdr.setFlags(Qt.ItemFlag.NoItemFlags)
-                f = hdr.font()
-                f.setBold(True)
-                hdr.setFont(f)
+                hdr.setData(HEADER_ROLE, True)
                 self.search.results.addItem(hdr)
                 last = h.path
             item = QListWidgetItem(f"   p. {h.page + 1}   {h.snippet}")
             item.setData(Qt.ItemDataRole.UserRole, h)
+            item.setData(PAGE_ROLE, h.page)
+            item.setData(SNIPPET_ROLE, h.snippet)
             self.search.results.addItem(item)
 
     # ---- OCR ----------------------------------------------------------------------
@@ -462,7 +490,8 @@ class MainWindow(QMainWindow):
         if not self.doc:
             return
         src = Path(self.doc_path)
-        missing = pages_needing_ocr(self.doc)
+        with LOCK:
+            missing = pages_needing_ocr(self.doc)
         if not missing and not force:
             QMessageBox.information(self, APP_NAME, "Every page already has a text layer.")
             return

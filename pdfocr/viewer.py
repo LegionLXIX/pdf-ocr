@@ -7,6 +7,9 @@ from PySide6.QtWidgets import (QApplication, QFileDialog, QGraphicsItem, QGraphi
                                QGraphicsScene, QGraphicsView, QListWidget, QListWidgetItem, QAbstractItemView, QMenu)
 import pymupdf
 
+from .pdflock import LOCK
+from .textutil import clean_text
+
 GAP = 12
 HIT_COLOR = QColor(255, 220, 0, 110)
 CURRENT_COLOR = QColor(255, 120, 0, 150)
@@ -21,16 +24,22 @@ class _RenderSignals(QObject):
 
 
 class _RenderJob(QRunnable):
-    def __init__(self, doc_path: str, page_no: int, zoom: float, signals: _RenderSignals):
+    """Render one page at `zoom` logical scale for a screen with device pixel ratio `dpr`.
+    The image is rendered at zoom*dpr and tagged with the ratio, so it is sharp on HiDPI screens."""
+
+    def __init__(self, doc_path: str, page_no: int, zoom: float, signals: _RenderSignals, dpr: float = 1.0):
         super().__init__()
-        self.doc_path, self.page_no, self.zoom, self.signals = doc_path, page_no, zoom, signals
+        self.doc_path, self.page_no, self.zoom, self.signals, self.dpr = doc_path, page_no, zoom, signals, dpr
 
     def run(self):
         try:
-            doc = pymupdf.open(self.doc_path)
-            pix = doc[self.page_no].get_pixmap(matrix=pymupdf.Matrix(self.zoom, self.zoom), alpha=False)
-            img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
-            doc.close()
+            s = self.zoom * self.dpr
+            with LOCK:
+                doc = pymupdf.open(self.doc_path)
+                pix = doc[self.page_no].get_pixmap(matrix=pymupdf.Matrix(s, s), alpha=False)
+                img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
+                doc.close()
+            img.setDevicePixelRatio(self.dpr)
             self.signals.done.emit(self.page_no, self.zoom, img)
         except Exception:
             pass
@@ -52,6 +61,7 @@ class PdfView(QGraphicsView):
         self.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         self.setBackgroundBrush(QBrush(QColor(60, 60, 60)))
         self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.SmartViewportUpdate)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)   # arrow / page keys work once the view is clicked
         # text selection state
         self._words: dict[int, list[tuple]] = {}     # page -> get_text("words") tuples
         self._selecting = False
@@ -105,8 +115,9 @@ class PdfView(QGraphicsView):
         self.page_items, self.page_rects = [], []
         y = GAP
         max_w = 0
-        for i in range(self.doc.page_count):
-            r = self.doc[i].rect
+        with LOCK:
+            rects = [self.doc[i].rect for i in range(self.doc.page_count)]
+        for i, r in enumerate(rects):
             w, h = r.width * self.zoom, r.height * self.zoom
             item = QGraphicsPixmapItem()
             item.setOffset(0, 0)
@@ -136,18 +147,21 @@ class PdfView(QGraphicsView):
     def _render_visible(self):
         if not self.doc:
             return
+        dpr = self.devicePixelRatioF()
         for i in self._visible_pages():
-            if self.rendered.get(i) == self.zoom or i in self.pending:
+            if self.rendered.get(i) == (self.zoom, dpr) or i in self.pending:
                 continue
             self.pending.add(i)
-            self.pool.start(_RenderJob(self.doc_path, i, self.zoom, self.signals))
+            self.pool.start(_RenderJob(self.doc_path, i, self.zoom, self.signals, dpr))
 
     def _on_rendered(self, page_no: int, zoom: float, img: QImage):
         self.pending.discard(page_no)
         if zoom != self.zoom or page_no >= len(self.page_items):
             return
-        self.page_items[page_no].setPixmap(QPixmap.fromImage(img))
-        self.rendered[page_no] = zoom
+        self.page_items[page_no].setPixmap(QPixmap.fromImage(img))   # keeps the image's device pixel ratio
+        self.rendered[page_no] = (zoom, img.devicePixelRatio())
+        if img.devicePixelRatio() != self.devicePixelRatioF():
+            self._render_timer.start()   # window moved to a screen with a different scale; redo
 
     def _on_scroll(self, _value):
         self._render_timer.start()
@@ -211,7 +225,8 @@ class PdfView(QGraphicsView):
 
     def _fit_page_size(self) -> tuple[float, float]:
         """Size in points of the page to fit: the current one (pages can differ in size)."""
-        r = self.doc[self.current_page()].rect
+        with LOCK:
+            r = self.doc[self.current_page()].rect
         return r.width, r.height
 
     def fit_width(self):
@@ -249,26 +264,29 @@ class PdfView(QGraphicsView):
             super().wheelEvent(e)
 
     # ---- highlights ---------------------------------------------------------------
-    def set_hits(self, hits: list[tuple[int, pymupdf.Rect]], current: int = -1):
-        """hits: (page, rect in page points). `current` indexes the one to colour differently."""
+    def set_hits(self, hits: list[tuple[int, list]], current: int = -1):
+        """hits: (page, [rects in page points]); a match that wraps lines has several rects.
+        `current` indexes the hit to colour differently."""
         for it in self.hit_items:
             self.scene().removeItem(it)
         self.hit_items = []
         self._hits = hits
-        for k, (p, r) in enumerate(hits):
-            item = QGraphicsRectItem()
-            item.setBrush(QBrush(CURRENT_COLOR if k == current else HIT_COLOR))
-            item.setPen(QPen(Qt.PenStyle.NoPen))
-            item.setZValue(5)
-            item.setData(0, p)
-            item.setData(1, (r.x0, r.y0, r.x1, r.y1))
-            self.scene().addItem(item)
-            self.hit_items.append(item)
+        for k, (p, rects) in enumerate(hits):
+            for r in rects:
+                item = QGraphicsRectItem()
+                item.setBrush(QBrush(CURRENT_COLOR if k == current else HIT_COLOR))
+                item.setPen(QPen(Qt.PenStyle.NoPen))
+                item.setZValue(5)
+                item.setData(0, p)
+                item.setData(1, (r.x0, r.y0, r.x1, r.y1))
+                item.setData(2, k)
+                self.scene().addItem(item)
+                self.hit_items.append(item)
         self._relayout_hits()
 
     def set_current_hit(self, current: int):
-        for k, it in enumerate(self.hit_items):
-            it.setBrush(QBrush(CURRENT_COLOR if k == current else HIT_COLOR))
+        for it in self.hit_items:
+            it.setBrush(QBrush(CURRENT_COLOR if it.data(2) == current else HIT_COLOR))
 
     def _relayout_hits(self):
         for it in self.hit_items:
@@ -345,8 +363,9 @@ class PdfView(QGraphicsView):
         if not self.has_area():
             return None
         page, r = self._area
-        pix = self.doc[page].get_pixmap(matrix=pymupdf.Matrix(dpi / 72, dpi / 72), clip=r, alpha=False)
-        return QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
+        with LOCK:
+            pix = self.doc[page].get_pixmap(matrix=pymupdf.Matrix(dpi / 72, dpi / 72), clip=r, alpha=False)
+            return QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
 
     def copy_area_image(self) -> bool:
         img = self.area_image()
@@ -371,7 +390,8 @@ class PdfView(QGraphicsView):
         if not self.has_area():
             return ""
         page, r = self._area
-        return self.doc[page].get_text("text", clip=r).strip()
+        with LOCK:
+            return clean_text(self.doc[page].get_text("text", clip=r)).strip()
 
     def copy_area_text(self) -> int:
         text = self.area_text()
@@ -384,7 +404,14 @@ class PdfView(QGraphicsView):
 
     def _page_words(self, page: int) -> list[tuple]:
         if page not in self._words:
-            words = self.doc[page].get_text("words") if self.doc else []
+            with LOCK:
+                raw = self.doc[page].get_text("words") if self.doc else []
+            # drop unmappable glyphs (dot leaders etc.) and words that were nothing but those
+            words = []
+            for w in raw:
+                t = clean_text(w[4])
+                if t:
+                    words.append((w[0], w[1], w[2], w[3], t, w[5], w[6], w[7]))
             # reading order: block, line, word
             self._words[page] = sorted(words, key=lambda w: (w[5], w[6], w[7]))
         return self._words[page]
@@ -421,6 +448,7 @@ class PdfView(QGraphicsView):
         return None if k is None else (page, k)
 
     def mousePressEvent(self, e):
+        self.setFocus()   # so the arrow keys drive the page view after a click, not the search box
         if e.button() == Qt.MouseButton.LeftButton and self.doc:
             if self.tool == "text":
                 self.clear_selection()
@@ -475,9 +503,24 @@ class PdfView(QGraphicsView):
         super().mouseDoubleClickEvent(e)
 
     def keyPressEvent(self, e):
-        if e.key() == Qt.Key.Key_Escape and (self._selection or self._area):
+        k = e.key()
+        if k == Qt.Key.Key_Escape and (self._selection or self._area):
             self.clear_selection()
             self.clear_area()
+            e.accept()
+            return
+        # Left/Right (and PageUp/PageDown) step whole pages; Up/Down keep Qt's smooth line scrolling
+        page_keys = {Qt.Key.Key_Left: -1, Qt.Key.Key_PageUp: -1, Qt.Key.Key_Right: 1, Qt.Key.Key_PageDown: 1}
+        if k in page_keys and self.doc:
+            self.go_to_page(self.current_page() + page_keys[k])
+            e.accept()
+            return
+        if k == Qt.Key.Key_Home and self.doc:
+            self.go_to_page(0)
+            e.accept()
+            return
+        if k == Qt.Key.Key_End and self.doc:
+            self.go_to_page(self.doc.page_count - 1)
             e.accept()
             return
         super().keyPressEvent(e)
@@ -603,7 +646,8 @@ class ThumbnailList(QListWidget):
         self._path = path
         if doc is None:
             return
-        self._zoom = self.THUMB_W / max(1.0, doc[0].rect.width)
+        with LOCK:
+            self._zoom = self.THUMB_W / max(1.0, doc[0].rect.width)
         blank = QPixmap(self.THUMB_W, int(self.THUMB_W * 1.4))
         blank.fill(QColor(220, 220, 220))
         for i in range(doc.page_count):
@@ -628,7 +672,7 @@ class ThumbnailList(QListWidget):
             if it.data(Qt.ItemDataRole.UserRole) or r.isNull() or not r.intersects(vp):
                 continue
             it.setData(Qt.ItemDataRole.UserRole, True)
-            self.pool.start(_RenderJob(self._path, i, self._zoom, self.signals))
+            self.pool.start(_RenderJob(self._path, i, self._zoom, self.signals, self.devicePixelRatioF()))
 
     def _on_rendered(self, page_no: int, zoom: float, img: QImage):
         if zoom != self._zoom or page_no >= self.count():
