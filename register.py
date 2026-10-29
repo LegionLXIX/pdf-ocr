@@ -12,10 +12,10 @@ import winreg
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-# pdfocr.exe is a copy of the venv's pythonw.exe (made by this script). Windows' "Open with" list keys
-# applications by exe name, so a dedicated name gets its own entry with our icon instead of "Python".
-PYTHONW = HERE / ".venv" / "Scripts" / "pdfocr.exe"
-PYTHONW_SRC = HERE / ".venv" / "Scripts" / "pythonw.exe"
+# pdfocr.exe is a small native launcher built by make_launcher.py (it starts pythonw main.py itself).
+# Explorer runs an "Applications\pdfocr.exe" default as `pdfocr.exe "<file>"` and ignores any other
+# arguments in the registry, so the exe has to know how to start the app on its own.
+LAUNCHER = HERE / "pdfocr.exe"
 MAIN = HERE / "main.py"
 ICON = HERE / "icon.ico"
 PROGID = "PDFOCR.Document"
@@ -52,14 +52,25 @@ def register():
         make_icon.main()
     import make_launcher
     make_launcher.build()
-    for p in (PYTHONW, MAIN, ICON):
+    for p in (LAUNCHER, MAIN, ICON):
         if not p.exists():
             sys.exit(f"missing: {p}")
-    cmd = f'"{PYTHONW}" "{MAIN}" "%1"'
+    # A running Explorer caches the launcher path it last resolved until the next sign-out, so keep a
+    # copy where an earlier registration may have pointed; the launcher finds the app folder from either.
+    old = HERE / ".venv" / "Scripts" / LAUNCHER.name
+    if old.parent.exists():
+        import shutil
+        shutil.copy2(LAUNCHER, old)
+    cmd = f'"{LAUNCHER}" "%1"'
     icon = f'"{ICON}",0'   # quoted: the path has spaces and a '+'
 
+    # App Paths: Windows 11 Explorer resolves an "Applications\pdfocr.exe" default through this key and
+    # silently does nothing on double-click if it is missing (ShellExecute from other programs still works)
+    _set(rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{LAUNCHER.name}", None, str(LAUNCHER))
+    _set(rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{LAUNCHER.name}", "Path", str(LAUNCHER.parent))
+
     # Application entry: this is what Windows 11's "Open with" / Default apps chooser actually lists
-    for exe in (PYTHONW.name, "PDF OCR.bat"):
+    for exe in (LAUNCHER.name, "PDF OCR.bat"):
         app = rf"Software\Classes\Applications\{exe}"
         _set(app, "FriendlyAppName", APP_NAME)
         _set(app, "AppUserModelID", APP_ID)
@@ -94,8 +105,9 @@ def register():
 
 def remove():
     _delete_tree(rf"Software\Classes\{PROGID}")
-    _delete_tree(rf"Software\Classes\Applications\{PYTHONW.name}")
+    _delete_tree(rf"Software\Classes\Applications\{LAUNCHER.name}")
     _delete_tree(r"Software\Classes\Applications\PDF OCR.bat")
+    _delete_tree(rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{LAUNCHER.name}")
     try:
         with winreg.OpenKey(HKCU, r"Software\Classes\.pdf\OpenWithProgids", 0, winreg.KEY_ALL_ACCESS) as k:
             winreg.DeleteValue(k, PROGID)

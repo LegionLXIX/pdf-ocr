@@ -565,4 +565,20 @@ def run(argv: list[str] | None = None):
     files = [a for a in argv[1:] if a.lower().endswith(".pdf")]
     if files:
         QTimer.singleShot(0, lambda: win.open_pdf(files[0]))
+
+    def bring_to_front():
+        # Launched through a file association the window can start minimized / behind Explorer;
+        # insist on a normal, foreground window.
+        win.setWindowState((win.windowState() & ~Qt.WindowState.WindowMinimized) | Qt.WindowState.WindowActive)
+        win.showNormal()
+        win.raise_()
+        win.activateWindow()
+        try:
+            ctypes.windll.user32.SetForegroundWindow(int(win.winId()))
+        except Exception:
+            pass
+
+    bring_to_front()
+    QTimer.singleShot(150, bring_to_front)
+    QTimer.singleShot(1200, bring_to_front)
     return app.exec()

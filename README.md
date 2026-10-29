@@ -39,11 +39,12 @@ Command-line OCR without the window (handy for batches):
 .venv\Scripts\python.exe -m pdfocr.pdf_ocr "book.pdf" [--pages 1-10] [--force] [-o out.pdf]
 ```
 
-**Open PDFs with it from Explorer:** `python register.py` creates `.venv\Scripts\pdfocr.exe` (a copy of
-the venv's `pythonw.exe` under its own name) and registers it as an application for `.pdf` with the icon,
-for the current user only. Windows doesn't let a program make itself the default, so pick it once:
-Settings > Apps > Default apps > type `.pdf` > *Choose an app on your PC* > `.venv\Scripts\pdfocr.exe`
-(Windows labels it "Python" after the exe's version info; the files still get the PDF OCR icon).
+**Open PDFs with it from Explorer:** `python register.py` compiles `pdfocr.exe` (a tiny native launcher,
+`launcher.cs`, built with the C# compiler that ships with .NET Framework, carrying the icon) and registers
+it as an application for `.pdf` with an App Paths entry, for the current user only. Windows 11 runs such a
+default as `pdfocr.exe "<file>"` and ignores anything else in the registry, which is why the launcher is a
+real exe rather than a renamed `pythonw.exe`. Windows doesn't let a program make itself the default, so pick
+it once: Settings > Apps > Default apps > type `.pdf` > *Choose an app on your PC* > `pdfocr.exe` in this folder.
 `python register.py --remove` undoes it. Re-run `register.py` if this folder ever moves.
 The icon is built from `icon_source.png` by `make_icon.py` (square crop, rounded corners, green border)
 into `icon.ico` / `icon.png`. Explorer caches icons by file path, so after changing the artwork give it
