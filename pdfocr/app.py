@@ -327,7 +327,7 @@ class MainWindow(QMainWindow):
         self.hits, self.current_hit = [], -1
         self.search.results.clear()
         self.search.count.setText("")
-        QTimer.singleShot(0, self.view.fit_width)
+        QTimer.singleShot(0, self.view.fit_page)   # whole page visible by default; Fit width is a click away
         if page:
             QTimer.singleShot(50, lambda: self.view.go_to_page(page))
         self.view.setFocus()   # arrow keys page through the document right away

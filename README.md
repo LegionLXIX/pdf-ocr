@@ -54,10 +54,11 @@ a new `ICON_NAME` in `make_icon.py` and run `register.py` again, or the old icon
 
 - **Viewer**: continuous scroll, Ctrl+wheel or +/− to zoom, thumbnails on the left, page box.
   ←/→ and PgUp/PgDn step a page, ↑/↓ scroll, Home/End jump to the first/last page (click the page
-  first so it has keyboard focus). Pages render at the screen's real pixel density, so they stay sharp
+  first so it has keyboard focus). Middle-click starts autoscroll: move the mouse away from the anchor
+  to scroll, faster the farther you go; click again (or release after dragging) to stop. Pages render at the screen's real pixel density, so they stay sharp
   on HiDPI / scaled displays.
-  *Fit width* (Ctrl+1) and *Fit page* (Ctrl+0, whole page visible) keep re-fitting as you resize the
-  window until you zoom manually.
+  A document opens at *Fit page* (whole page visible, Ctrl+0); *Fit width* is Ctrl+1. Both keep
+  re-fitting as you resize the window until you zoom manually.
 - **Text selection**: the default tool is *Select text* (T): drag over words, double-click a word,
   right-click > *Select all on this page*, Ctrl+A for the current page. Ctrl+C copies (lines are kept,
   words joined with spaces). *Hand* (H) switches the left button to panning. On OCR'd scans the selection

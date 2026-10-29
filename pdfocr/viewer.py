@@ -72,6 +72,15 @@ class PdfView(QGraphicsView):
         self._area_anchor: tuple[int, float, float] | None = None   # page, x, y (page points)
         self._area: tuple[int, pymupdf.Rect] | None = None           # finished box
         self._area_item: QGraphicsRectItem | None = None
+        # middle-click autoscroll (Windows style): click to start, move away from the anchor to scroll,
+        # faster the farther you go; click again (or release after a drag) to stop
+        self._auto_anchor = None            # QPointF in viewport coords while autoscrolling
+        self._auto_pos = None
+        self._auto_moved = False
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setInterval(16)
+        self._auto_timer.timeout.connect(self._auto_tick)
+        self.viewport().setMouseTracking(True)   # move events without a button held, for sticky mode
         self.tool = "text"
         self.set_tool("text")
         self.doc: pymupdf.Document | None = None
@@ -257,6 +266,8 @@ class PdfView(QGraphicsView):
             self._refitting = False
 
     def wheelEvent(self, e):
+        if self._auto_anchor is not None:
+            self._auto_stop()
         if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.set_zoom(self.zoom * (1.1 if e.angleDelta().y() > 0 else 1 / 1.1))
             e.accept()
@@ -307,12 +318,44 @@ class PdfView(QGraphicsView):
             self.clear_selection()
         if tool != "area":
             self.clear_area()
-        if tool == "hand":
-            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag if tool == "hand" else QGraphicsView.DragMode.NoDrag)
+        self._apply_cursor()
+
+    def _apply_cursor(self):
+        if self._auto_anchor is not None:
+            self.viewport().setCursor(Qt.CursorShape.SizeAllCursor)
+        elif self.tool == "hand":
             self.viewport().unsetCursor()
         else:
-            self.setDragMode(QGraphicsView.DragMode.NoDrag)
-            self.viewport().setCursor(Qt.CursorShape.IBeamCursor if tool == "text" else Qt.CursorShape.CrossCursor)
+            self.viewport().setCursor(Qt.CursorShape.IBeamCursor if self.tool == "text" else Qt.CursorShape.CrossCursor)
+
+    # ---- middle-click autoscroll --------------------------------------------------
+    AUTO_DEAD_ZONE = 10      # px around the anchor where nothing scrolls
+    AUTO_GAIN = 0.08         # px per tick per px of distance beyond the dead zone
+
+    def _auto_start(self, pos):
+        self._auto_anchor = pos
+        self._auto_pos = pos
+        self._auto_moved = False
+        self._auto_timer.start()
+        self._apply_cursor()
+
+    def _auto_stop(self):
+        self._auto_timer.stop()
+        self._auto_anchor = None
+        self._auto_pos = None
+        self._apply_cursor()
+
+    def _auto_tick(self):
+        if self._auto_anchor is None or self._auto_pos is None:
+            return
+        for d, bar in ((self._auto_pos.y() - self._auto_anchor.y(), self.verticalScrollBar()),
+                       (self._auto_pos.x() - self._auto_anchor.x(), self.horizontalScrollBar())):
+            if abs(d) <= self.AUTO_DEAD_ZONE:
+                continue
+            step = (abs(d) - self.AUTO_DEAD_ZONE) * self.AUTO_GAIN
+            step = step * step / 10 + step   # gentle near the anchor, quick far away
+            bar.setValue(int(bar.value() + (step if d > 0 else -step)))
 
     def set_select_mode(self, select: bool):
         self.set_tool("text" if select else "hand")
@@ -449,6 +492,14 @@ class PdfView(QGraphicsView):
 
     def mousePressEvent(self, e):
         self.setFocus()   # so the arrow keys drive the page view after a click, not the search box
+        if self._auto_anchor is not None:   # any click ends autoscroll
+            self._auto_stop()
+            e.accept()
+            return
+        if e.button() == Qt.MouseButton.MiddleButton and self.doc:
+            self._auto_start(e.position())
+            e.accept()
+            return
         if e.button() == Qt.MouseButton.LeftButton and self.doc:
             if self.tool == "text":
                 self.clear_selection()
@@ -464,6 +515,12 @@ class PdfView(QGraphicsView):
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
+        if self._auto_anchor is not None:
+            self._auto_pos = e.position()
+            if (self._auto_pos - self._auto_anchor).manhattanLength() > self.AUTO_DEAD_ZONE:
+                self._auto_moved = True
+            e.accept()
+            return
         if self._selecting:
             cur = self._hit_test(e.position().toPoint())
             if cur is not None:
@@ -479,6 +536,12 @@ class PdfView(QGraphicsView):
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.MiddleButton and self._auto_anchor is not None:
+            if self._auto_moved:
+                self._auto_stop()   # held and dragged: stop on release
+            # a plain click stays in autoscroll until the next click
+            e.accept()
+            return
         if self._selecting:
             self._selecting = False
             e.accept()
@@ -504,6 +567,10 @@ class PdfView(QGraphicsView):
 
     def keyPressEvent(self, e):
         k = e.key()
+        if k == Qt.Key.Key_Escape and self._auto_anchor is not None:
+            self._auto_stop()
+            e.accept()
+            return
         if k == Qt.Key.Key_Escape and (self._selection or self._area):
             self.clear_selection()
             self.clear_area()
