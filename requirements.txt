@@ -8,3 +8,5 @@ PySide6>=6.8
 pillow
 anthropic>=2.0
 keyring
+opencv-python-headless
+numpy

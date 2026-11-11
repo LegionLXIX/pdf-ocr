@@ -8,6 +8,7 @@ The original file is never modified; the default output is "<name> (OCR).pdf" be
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -26,12 +27,52 @@ OCR_MARKER = "PDFOCR-done"  # stamped into the PDF keywords once a file has been
 VERTICAL_ROTATION = -90     # degrees for vertical text; sign checked by the vertical-text test (chars must run downward)
 
 
+WORK_SUFFIX = " (OCR)"
+
+
 def output_path_for(src: Path) -> Path:
-    return src.with_name(f"{src.stem} (OCR).pdf")
+    """The working copy of a book: "<name> (OCR).pdf" beside the original. It holds the OCR text layer and,
+    once translated, the English layer too. A working copy is its own output, so it is updated in place."""
+    src = Path(src)
+    stem = src.stem
+    for old in (" (EN)", WORK_SUFFIX):
+        if stem.endswith(old):
+            stem = stem[: -len(old)]
+    return src.with_name(f"{stem}{WORK_SUFFIX}.pdf")
+
+
+def part_path_for(dst: Path) -> Path:
+    """Where a new version of `dst` is written before it replaces the old one."""
+    return dst.with_name(dst.stem + ".part.pdf")
 
 
 def page_has_text(page: pymupdf.Page) -> bool:
     return len(page.get_text().strip()) >= MIN_TEXT_CHARS
+
+
+def text_kinds(page: pymupdf.Page) -> tuple[bool, bool]:
+    """(has visible text, has invisible text). Invisible text is a layer this app wrote (OCR or English);
+    visible text is the document's own."""
+    visible = invisible = False
+    for span in page.get_texttrace():
+        if not any(ch[0] > 32 for ch in span.get("chars", ())):
+            continue
+        if span.get("type") == 3:
+            invisible = True
+        else:
+            visible = True
+    return visible, invisible
+
+
+def strip_text_layers(page: pymupdf.Page) -> bool:
+    """Remove the invisible text this app wrote on a page (the OCR layer and the English layer).
+    The scan, drawings and any visible text of the document are left exactly as they are."""
+    if not text_kinds(page)[1]:
+        return False
+    page.add_redact_annot(page.rect)
+    page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                          text=pymupdf.PDF_REDACT_TEXT_REMOVE_INVISIBLE)
+    return True
 
 
 def is_ocr_done(doc: pymupdf.Document) -> bool:
@@ -52,8 +93,17 @@ def render_page(page: pymupdf.Page, dpi: int) -> tuple[Image.Image, pymupdf.Matr
     return Image.frombytes("RGB", (pix.width, pix.height), pix.samples), mat
 
 
+def isolate_content(page: pymupdf.Page):
+    """Make sure text added to the page starts from a clean graphics state. A page whose own content
+    leaves a transformation in force (a turned page does, and so do some scanners' files) would otherwise
+    pass that transformation on to our text, which then lands somewhere else on the page."""
+    if not page.is_wrapped:
+        page.wrap_contents()
+
+
 def write_text_layer(page: pymupdf.Page, ocr: PageOcr, mat: pymupdf.Matrix) -> int:
     """Insert OCR words as invisible text positioned over the scan. Returns word count."""
+    isolate_content(page)
     # pixel -> page (rotated display) -> unrotated page space, which insert_text uses
     inv = ~mat * page.derotation_matrix
     n = 0
@@ -128,16 +178,41 @@ def ocr_pdf(
     engine: OcrEngine | None = None,
     progress: Callable[[int, int, str], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
+    replace: bool = True,
+    fresh: bool = False,
 ) -> tuple[Path, int, list[str]]:
-    """OCR `src` into `dst`. Returns (output path, pages OCR'd, page texts in page order for indexing)."""
+    """OCR `src` into `dst`. Returns (output path, pages OCR'd, page texts in page order for indexing).
+
+    force reads pages again even when they have a text layer: the old layer is taken off first, and a
+    page's English is written back from the translation stored in the file. fresh (with force) is for a
+    page whose old reading was wrong, such as one that was sideways: its translation is dropped as well,
+    so the page can be translated again from the new reading.
+
+    When `src` is already a working copy (dst == src) the new version is written beside it and then
+    replaces it. replace=False leaves that new version in its ".part.pdf" file and returns that path,
+    for a caller that has the document open and must let go of it first."""
     src = Path(src)
     dst = Path(dst) if dst else output_path_for(src)
+    in_place = dst.resolve() == src.resolve()
+    target = part_path_for(dst) if in_place else dst
     engine = engine or OcrEngine()
     with LOCK:
         doc = pymupdf.open(src)
         todo = list(pages) if pages is not None else list(range(doc.page_count))
+        todo = [i for i in todo if 0 <= i < doc.page_count]
+        stripped: list[int] = []
         if not force:
             todo = [i for i in todo if not page_has_text(doc[i])]
+        else:
+            keep = []
+            for i in todo:
+                visible, invisible = text_kinds(doc[i])
+                if visible and invisible and not fresh:
+                    continue          # the document's own text plus a layer of ours: nothing to redo
+                if strip_text_layers(doc[i]):
+                    stripped.append(i)
+                keep.append(i)
+            todo = keep
         texts = [""] * doc.page_count
         for i in range(doc.page_count):
             if i not in todo:
@@ -165,16 +240,28 @@ def ocr_pdf(
             progress(done, len(todo), f"Page {batch[-1] + 1} of {doc.page_count}")
 
     with LOCK:
+        if force and todo:
+            from . import translate as tr   # imported here: translate imports this module
+            if fresh:
+                tr.forget_pages(doc, dst, todo)
+            else:
+                tr.restore_english(doc, stripped)
         if todo:
             meta = dict(doc.metadata or {})
             kw = meta.get("keywords") or ""
-            if OCR_MARKER not in kw:
+            # the stamp means "nothing left for the OCR button": not true after a pass over chosen pages
+            # of a book whose other pages are still bare scans
+            whole = pages is None or all(i in todo or page_has_text(doc[i]) for i in range(doc.page_count))
+            if whole and OCR_MARKER not in kw:
                 meta["keywords"] = (kw + " " + OCR_MARKER).strip()
             doc.set_metadata({k: v for k, v in meta.items() if k not in ("format", "encryption")})
             dst.parent.mkdir(parents=True, exist_ok=True)
-            doc.save(dst, garbage=1, deflate=True)
+            doc.save(target, garbage=1, deflate=True)
         doc.close()
-    return dst, len(todo), texts
+        if todo and in_place and replace:
+            os.replace(target, dst)
+            target = dst
+    return (target if todo else dst), len(todo), texts
 
 
 def _parse_pages(spec: str, count: int) -> list[int]:

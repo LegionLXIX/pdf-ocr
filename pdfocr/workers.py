@@ -31,9 +31,11 @@ class OcrWorker(QThread):
     file_failed = Signal(str, str)          # src path, error
     finished_all = Signal()
 
-    def __init__(self, paths: list[Path], library: Library | None, dpi: int = 200, force: bool = False):
+    def __init__(self, paths: list[Path], library: Library | None, dpi: int = 200, force: bool = False,
+                 pages: list[int] | None = None, fresh: bool = False):
         super().__init__()
         self.paths, self.library, self.dpi, self.force = [Path(p) for p in paths], library, dpi, force
+        self.pages, self.fresh = pages, fresh     # pages: only these (0-based); fresh: drop their translation too
         self._cancel = False
 
     def cancel(self):
@@ -46,10 +48,12 @@ class OcrWorker(QThread):
                 break
             try:
                 out, n, texts = ocr_pdf(
-                    src, output_path_for(src), force=self.force, dpi=self.dpi, engine=engine,
+                    src, output_path_for(src), self.pages, force=self.force, dpi=self.dpi, engine=engine,
+                    fresh=self.fresh,
                     progress=lambda d, t, m, s=src: self.progress.emit(str(s), d, t, m),
-                    cancelled=lambda: self._cancel)
-                if self.library is not None and n:
+                    cancelled=lambda: self._cancel, replace=False)
+                # a working copy updated in place comes back as a ".part.pdf" for the window to swap in
+                if self.library is not None and n and not out.name.endswith(".part.pdf"):
                     self.library.index_pdf(out, texts)
                 self.file_done.emit(str(src), str(out), n)
             except InterruptedError:

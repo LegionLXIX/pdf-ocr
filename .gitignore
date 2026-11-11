@@ -13,3 +13,7 @@ launcher_ok.txt
 # local data
 *.db
 *.log
+
+# spending ledger and translation cache (per machine)
+/data/
+*.part.pdf

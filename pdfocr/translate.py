@@ -3,7 +3,8 @@
 For each page: Surya (local, GPU) finds the text blocks and reads the Japanese; the page image and those
 blocks go to Claude, which returns an English translation per block; the English is written into the PDF
 as invisible text over the block it translates, and stored inside the file for the viewer's overlay.
-Output is "<name> (EN).pdf" beside the source; the source is never modified. Pages already translated are
+The result goes into the book's working copy, "<name> (OCR).pdf" (the same file the OCR button writes;
+created from the source if it does not exist yet); the source is never modified. Pages already translated are
 never sent (or paid for) twice: finished pages are cached on disk and recorded inside the output file.
 
 Every request goes through the spending guard in budget.py.
@@ -34,7 +35,9 @@ import pymupdf
 from PIL import Image
 
 from .budget import APP_DIR, Budget, BudgetExceeded, BudgetNotSet, cost_of_usage, price_row, worst_case_cost
-from .pdf_ocr import DEFAULT_DPI, OCR_MARKER, _font_for, page_has_text, render_page, write_invisible_line
+from .pdf_ocr import (DEFAULT_DPI, OCR_MARKER, _font_for, isolate_content, page_has_text, part_path_for,
+                      render_page, write_invisible_line)
+from .pdf_ocr import output_path_for as working_copy_for
 from .pdflock import LOCK
 from .textutil import clean_text
 
@@ -162,11 +165,9 @@ class TranslateResult:
 
 
 def output_path_for(src: Path) -> Path:
-    stem = src.stem
-    for suffix in (" (EN)", " (OCR)"):
-        if stem.endswith(suffix):
-            stem = stem[: -len(suffix)]
-    return src.with_name(f"{stem} (EN).pdf")
+    """The translation goes into the book's working copy, "<name> (OCR).pdf": the same file the OCR
+    button writes. There is no separate English file, and the original is never modified."""
+    return working_copy_for(Path(src))
 
 
 def load_translation(doc: pymupdf.Document) -> dict | None:
@@ -177,6 +178,64 @@ def load_translation(doc: pymupdf.Document) -> dict | None:
     except Exception:
         pass
     return None
+
+
+def save_translation(doc: pymupdf.Document, store: dict):
+    """Write the translation store back into the PDF."""
+    if EMBED_NAME in doc.embfile_names():
+        doc.embfile_del(EMBED_NAME)
+    doc.embfile_add(EMBED_NAME, json.dumps(store, ensure_ascii=False).encode("utf-8"))
+
+
+def forget_pages(doc: pymupdf.Document, dst: Path, pages: list[int]) -> int:
+    """Drop the stored translation of `pages` (and their cache entries), so they count as untranslated.
+    Returns how many of them had a translation. The invisible English text is removed by the caller."""
+    n = 0
+    store = load_translation(doc)
+    if store:
+        for p in pages:
+            if store["pages"].pop(str(p), None) is not None:
+                n += 1
+        if n:
+            save_translation(doc, store)
+    for p in pages:
+        _cache_forget(dst, p)
+    return n
+
+
+def restore_english(doc: pymupdf.Document, pages: list[int]):
+    """Write the invisible English of `pages` again from the stored translation (after their text
+    layers were taken off for a new OCR pass)."""
+    store = load_translation(doc)
+    if not store:
+        return
+    for p in pages:
+        entry = store["pages"].get(str(p))
+        if not entry or p >= doc.page_count:
+            continue
+        page = doc[p]
+        isolate_content(page)
+        for u in entry.get("units", []):
+            if u.get("en", "").strip():
+                write_invisible_box(page, english_rect(u["bbox"], page.rect, u["en"]), u["en"])
+
+
+def turn_units(doc: pymupdf.Document, dst: Path, page: int, display_map: pymupdf.Matrix) -> bool:
+    """A page was turned: move its stored translation boxes with it (`display_map` takes a point of the
+    page as it was displayed to where it is displayed now). A stored page with no blocks is dropped."""
+    _cache_forget(dst, page)     # the cache holds positions from before the turn
+    store = load_translation(doc)
+    if not store or str(page) not in store["pages"]:
+        return False
+    units = store["pages"][str(page)].get("units", [])
+    if not units:
+        del store["pages"][str(page)]
+    for u in units:
+        r = pymupdf.Rect(*u["bbox"]) * display_map
+        r.normalize()
+        u["bbox"] = [r.x0, r.y0, r.x1, r.y1]
+    save_translation(doc, store)
+    return True
 
 
 def english_rect(bbox, page_rect: pymupdf.Rect, text: str) -> pymupdf.Rect:
@@ -338,6 +397,13 @@ def _cache_get(dst: Path, page: int) -> dict | None:
         return None
 
 
+def _cache_forget(dst: Path, page: int):
+    try:
+        (_cache_dir(dst) / f"p{page:05d}.json").unlink()
+    except OSError:
+        pass
+
+
 def _cache_put(dst: Path, page: int, entry: dict):
     d = _cache_dir(dst)
     d.mkdir(parents=True, exist_ok=True)
@@ -379,6 +445,7 @@ def assemble(base: Path, out: Path, new_pages: dict[int, dict], meta: dict):
                 if str(pno) in store["pages"] or pno >= doc.page_count:
                     continue
                 page = doc[pno]
+                isolate_content(page)
                 if not page_has_text(page):   # a bare scan: give it the Japanese layer too
                     for x0, y0, x1, y1, text in entry.get("ocr_lines", []):
                         write_invisible_line(page, pymupdf.Rect(x0, y0, x1, y1), text)
@@ -387,9 +454,7 @@ def assemble(base: Path, out: Path, new_pages: dict[int, dict], meta: dict):
                     write_invisible_box(page, english_rect(u["bbox"], page.rect, u["en"]), u["en"])
                 store["pages"][str(pno)] = {"model": entry.get("model", ""), "units": units}
             store.update(meta)
-            if EMBED_NAME in doc.embfile_names():
-                doc.embfile_del(EMBED_NAME)
-            doc.embfile_add(EMBED_NAME, json.dumps(store, ensure_ascii=False).encode("utf-8"))
+            save_translation(doc, store)
             md = dict(doc.metadata or {})
             kw = set((md.get("keywords") or "").split())
             kw.add(EN_MARKER)
@@ -440,7 +505,7 @@ def translate_pdf(
     progress: Callable[[int, int, str, float], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> TranslateResult:
-    """Translate `pages` (0-based; default all) of `src` into "<name> (EN).pdf".
+    """Translate `pages` (0-based; default all) of `src` into its working copy, "<name> (OCR).pdf".
 
     run_cap: spend at most this many dollars in this run, on top of the monthly limit.
     replace=False leaves the result in a temp file (`result.output`) for the caller to swap in, for when
@@ -450,11 +515,9 @@ def translate_pdf(
     dst = output_path_for(src)
     budget = budget or Budget()
     res = TranslateResult(dst=dst)
-    base = src
-    if dst.exists() and dst != src:
-        with LOCK, pymupdf.open(dst) as d:
-            if load_translation(d):
-                base = dst                         # carry on from the earlier run's output
+    # build on the working copy when the book has one (it carries the OCR layer and any pages already
+    # translated); otherwise start from the original, which is only read
+    base = dst if dst.exists() else src
     with LOCK:
         doc = pymupdf.open(base)
         page_count = doc.page_count
@@ -625,7 +688,7 @@ def translate_pdf(
 
         if new_pages:
             report("Writing the PDF…")
-            tmp = dst.with_name(dst.stem + ".part.pdf")
+            tmp = part_path_for(dst)
             assemble(base, tmp, new_pages, {"model": model})
             if replace:
                 with LOCK:

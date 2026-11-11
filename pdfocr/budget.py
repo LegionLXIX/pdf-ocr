@@ -26,7 +26,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "PDF OCR"
+# The ledger lives in the app's own folder, not under %LOCALAPPDATA%: sandboxed tools (the Claude desktop
+# app runs commands that way) get a private copy of files they write under AppData, so a ledger kept
+# there splits in two and each side undercounts. One file in the app folder is seen by everything.
+APP_DIR = Path(__file__).resolve().parent.parent / "data"
+OLD_APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "PDF OCR"   # where it was until 2026-11-10
 LEDGER_PATH = APP_DIR / "spend.json"
 PRICES_PATH = APP_DIR / "prices.json"   # optional overrides, same shape as PRICES
 
@@ -109,6 +113,31 @@ class Budget:
         self.path = Path(path)
         self._lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path == LEDGER_PATH:
+            self._import_old(OLD_APP_DIR / "spend.json")
+
+    def _import_old(self, old: Path):
+        """Bring in the ledger from its old place under AppData: every entry not seen before, and the
+        limit if none is set here. Safe to repeat; each old entry is imported once."""
+        try:
+            src = json.loads(old.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        with self._lock:
+            data = self._load()
+            seen = set(data.get("imported_ids", [])) | {e["id"] for e in data["entries"]}
+            fresh = [e for e in src.get("entries", []) if e.get("id") and e["id"] not in seen]
+            changed = bool(fresh)
+            data["entries"].extend(fresh)
+            data["entries"].sort(key=lambda e: e["ts"])
+            data["imported_ids"] = sorted(set(data.get("imported_ids", [])) | {e["id"] for e in src.get("entries", []) if e.get("id")})
+            old_settings = src.get("settings") or {}
+            if data["settings"]["monthly_limit_usd"] is None and old_settings.get("monthly_limit_usd") is not None:
+                data["settings"].update({k: old_settings[k] for k in ("monthly_limit_usd", "margin_usd", "period_start_day")
+                                         if k in old_settings})
+                changed = True
+            if changed or not self.path.exists():
+                self._save(data)
 
     # ---- storage ------------------------------------------------------------------
     def _load(self) -> dict:

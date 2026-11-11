@@ -16,9 +16,10 @@ from PySide6.QtWidgets import (QApplication, QDialog, QDockWidget, QFileDialog, 
 
 from . import translate as tr
 from .budget import Budget
-from .dialogs import ImagesDialog, TranslateDialog, TranslateSettingsDialog
+from .dialogs import ImagesDialog, RotateDialog, TranslateDialog, TranslateSettingsDialog
 from .library import Library, LibraryHit
-from .pdf_ocr import output_path_for, pages_needing_ocr
+from .pages import rotate_pages
+from .pdf_ocr import output_path_for, pages_needing_ocr, text_kinds
 from .pdflock import LOCK
 from .results import HEADER_ROLE, PAGE_ROLE, SNIPPET_ROLE, ResultDelegate
 from .viewer import PdfView, ThumbnailList
@@ -28,6 +29,19 @@ APP_NAME = "PDF OCR"
 APP_ID = "PDFOCR.App"  # AppUserModelID: taskbar shows our icon, not Python's (must match register.py)
 ICON_PATH = Path(__file__).resolve().parent.parent / "icon.ico"
 MAX_RECENT = 12
+
+
+def page_names(pages: list[int]) -> str:
+    """0-based pages as people write them: "Page 6", "Pages 9\u201315", "Pages 3, 7 and 9\u201311"."""
+    runs, pages = [], sorted(set(pages))
+    for p in pages:
+        if runs and p == runs[-1][1] + 1:
+            runs[-1][1] = p
+        else:
+            runs.append([p, p])
+    parts = [str(a + 1) if a == b else f"{a + 1}\u2013{b + 1}" for a, b in runs]
+    text = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+    return ("Page " if len(pages) == 1 else "Pages ") + text
 
 
 class ProgressDialog(QDialog):
@@ -102,6 +116,9 @@ class MainWindow(QMainWindow):
         self.ocr_worker: OcrWorker | None = None
         self.index_worker: IndexWorker | None = None
         self.pending_search = ""
+        self._turned: dict[str, set[int]] = {}    # document path -> pages turned this session and not read again yet
+        self._rereading: set[int] | None = None   # pages of the OCR job in progress that are being read again
+        self._info_action = self.ocr_current      # what the notice bar's button does
 
         self.view = PdfView()
         self.setCentralWidget(self._with_infobar(self.view))
@@ -113,6 +130,8 @@ class MainWindow(QMainWindow):
         self.view.area_copied.connect(lambda w, h: self.statusBar().showMessage(
             f"Copied image {w}×{h} px to the clipboard — right-click the box to save it or copy its text", 6000))
         self.view.area_saved.connect(lambda p: self.statusBar().showMessage(f"Saved {p}", 6000))
+        self.view.rotate_requested.connect(lambda page, deg: self.rotate([page], deg))
+        self.view.reread_requested.connect(lambda page: self.reread_pages([page]))
 
         self.thumbs = ThumbnailList()
         self.thumbs.currentRowChanged.connect(self._on_thumb_clicked)
@@ -152,7 +171,7 @@ class MainWindow(QMainWindow):
         il.setContentsMargins(10, 6, 10, 6)
         self.info_label = QLabel("")
         self.info_btn = QPushButton("Make searchable (OCR)")
-        self.info_btn.clicked.connect(self.ocr_current)
+        self.info_btn.clicked.connect(lambda: self._info_action())
         self.info_close = QToolButton()
         self.info_close.setText("✕")
         self.info_close.setToolTip("Hide this notice for this document (the toolbar's OCR button still works)")
@@ -170,6 +189,7 @@ class MainWindow(QMainWindow):
 
     def _dismiss_infobar(self):
         self._infobar_dismissed.add(self.doc_path)
+        self._turned.pop(self.doc_path, None)
         self.infobar.hide()
 
     def _build_toolbar(self):
@@ -287,6 +307,13 @@ class MainWindow(QMainWindow):
         m_edit.addAction("&Find…", QKeySequence.StandardKey.Find,
                          lambda: (self.search.edit.setFocus(), self.search.edit.selectAll()))
 
+        m_page = self.menuBar().addMenu("&Page")
+        m_page.addAction("Rotate page &right", "Ctrl+R", lambda: self.rotate(None, 90))
+        m_page.addAction("Rotate page &left", "Ctrl+Shift+R", lambda: self.rotate(None, 270))
+        m_page.addAction("Rotate &several pages…", self.rotate_range)
+        m_page.addSeparator()
+        m_page.addAction("Read this page &again (OCR)", lambda: self.reread_pages(None))
+
         m_lib = self.menuBar().addMenu("&Library")
         m_lib.addAction("&Add folder to library…", self.add_folder)
         m_lib.addAction("&OCR everything that needs it", self.ocr_library)
@@ -297,6 +324,14 @@ class MainWindow(QMainWindow):
         m_tr = self.menuBar().addMenu("&Translate")
         m_tr.addAction("&Translate to English…", self.translate_current)
         m_tr.addAction(self.a_english)
+        self.a_boxes = QAction("Show the English in plain &boxes", self, checkable=True)
+        self.a_boxes.setToolTip("Off: the English replaces the Japanese on the page. "
+                                "On: the page is left as it is and the English sits in white boxes over it.")
+        self.a_boxes.setChecked(self.settings.value("overlay_boxes", False, type=bool))
+        self.view.set_overlay_boxes(self.a_boxes.isChecked())
+        self.a_boxes.toggled.connect(lambda on: (self.settings.setValue("overlay_boxes", on),
+                                                 self.view.set_overlay_boxes(on)))
+        m_tr.addAction(self.a_boxes)
         m_tr.addSeparator()
         m_tr.addAction("API &key, limit and spending…", lambda: TranslateSettingsDialog(self, self.budget).exec())
 
@@ -326,18 +361,17 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, APP_NAME, f"Could not open PDF:\n{e}")
                 return
-            # Prefer the translated copy, else the OCR'd one, of a scan the user double-clicked
-            en_sibling, ocr_sibling = tr.output_path_for(p), output_path_for(p)
-            if en_sibling.exists() and p != en_sibling:
-                doc.close()
-                doc = pymupdf.open(en_sibling)
-                p = en_sibling
-                self.statusBar().showMessage(f"Opened the translated copy: {p.name}", 6000)
-            elif ocr_sibling.exists() and p != ocr_sibling and pages_needing_ocr(doc):
-                doc.close()
-                doc = pymupdf.open(ocr_sibling)
-                p = ocr_sibling
-                self.statusBar().showMessage(f"Opened the OCR'd copy: {p.name}", 6000)
+            # A book's working copy (OCR'd, perhaps translated, pages turned) opens in place of the
+            # original it was made from
+            work = output_path_for(p)
+            if work.exists() and p != work:
+                try:
+                    other = pymupdf.open(work)
+                except Exception:
+                    other = None
+                if other is not None:
+                    doc.close()
+                    doc, p = other, work
             if self.doc:
                 self.doc.close()
             missing = pages_needing_ocr(doc)
@@ -365,6 +399,8 @@ class MainWindow(QMainWindow):
         if page:
             QTimer.singleShot(50, lambda: self.view.go_to_page(page))
         self.view.setFocus()   # arrow keys page through the document right away
+        self.info_btn.setText("Make searchable (OCR)")
+        self._info_action = self.ocr_current
         if missing and str(p) not in self._infobar_dismissed:
             n = len(missing)
             self.info_label.setText(
@@ -379,6 +415,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
         self.statusBar().showMessage(f"{p}  ·  {doc.page_count} pages", 8000)
+        self._offer_reread()
         if search:
             self.search.edit.setText(search)
             self.search.this_doc.setChecked(True)
@@ -533,12 +570,12 @@ class MainWindow(QMainWindow):
             return
         self._start_ocr([src], force=force)
 
-    def _start_ocr(self, paths: list[Path], force: bool = False):
+    def _start_ocr(self, paths: list[Path], force: bool = False, pages: list[int] | None = None, fresh: bool = False):
         if self.ocr_worker and self.ocr_worker.isRunning():
             QMessageBox.information(self, APP_NAME, "An OCR job is already running.")
             return
         dlg = ProgressDialog("OCR", self)
-        self.ocr_worker = OcrWorker(paths, self.library, force=force)
+        self.ocr_worker = OcrWorker(paths, self.library, force=force, pages=pages, fresh=fresh)
         self.ocr_worker.progress.connect(
             lambda p, d, t, m: dlg.update(d, t, f"{Path(p).name}\n{m}"))
         self.ocr_worker.file_done.connect(self._on_ocr_file_done)
@@ -549,11 +586,128 @@ class MainWindow(QMainWindow):
         self.ocr_worker.start()
         dlg.exec()
 
+    def _swap_in(self, new: Path, dst: Path, index: bool = True) -> bool:
+        """Put a freshly written file in place of `dst`, which may be the document that is open."""
+        if self.search_worker and self.search_worker.isRunning():
+            self.search_worker.cancel()
+            self.search_worker.wait()
+        try:
+            with LOCK:   # no page is being rendered while the file changes hands
+                if self.doc is not None and Path(self.doc_path) == dst:
+                    self.view.set_document(None)
+                    self.thumbs.set_document(None, "")
+                    self.doc.close()
+                    self.doc = None
+                os.replace(new, dst)
+        except OSError as e:
+            QMessageBox.warning(self, APP_NAME, f"The new version is saved as\n{new}\nbut could not replace\n{dst}\n\n{e}")
+            return False
+        if index:
+            try:
+                self.library.index_pdf(dst)
+            except Exception:
+                pass
+        return True
+
     def _on_ocr_file_done(self, src: str, out: str, n: int):
-        self.statusBar().showMessage(f"OCR'd {n} pages → {Path(out).name}", 10000)
-        if src == self.doc_path or out == self.doc_path:
+        if out.endswith(".part.pdf"):   # a working copy OCR'd in place
+            dst = output_path_for(Path(src))
+            if not self._swap_in(Path(out), dst):
+                return
+            out = str(dst)
+        reread, self._rereading = self._rereading, None
+        if reread:
+            for key in (src, out):
+                self._turned.get(key, set()).difference_update(reread)
+        if self.doc is None or src == self.doc_path or out == self.doc_path:
             q = self.search.edit.text()
             self.open_pdf(out, page=self.view.current_page(), search=q)
+        msg = f"OCR'd {n} page{'s' if n != 1 else ''} → {Path(out).name}"
+        if reread and self.view.has_translation():
+            msg += (f"  ·  To translate {'it' if len(reread) == 1 else 'them'}: Translate > Translate to English "
+                    f"(pages already done are skipped)")
+        self.statusBar().showMessage(msg, 15000)
+
+    # ---- turning pages --------------------------------------------------------------
+    def rotate(self, pages: list[int] | None, degrees: int):
+        """Turn pages (default: the current one) and save the turn into the book's working copy."""
+        if not self.doc:
+            return
+        if self.ocr_worker and self.ocr_worker.isRunning():
+            QMessageBox.information(self, APP_NAME, "Wait for the OCR job to finish first.")
+            return
+        here = self.view.current_page()
+        pages = [here] if pages is None else pages
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            dst, out, turned = rotate_pages(Path(self.doc_path), pages, degrees, replace=False)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, APP_NAME, f"Could not rotate:\n{type(e).__name__}: {e}")
+            return
+        try:
+            if not turned or not self._swap_in(out, dst, index=False):
+                return
+            self._turned.setdefault(str(dst), set()).update(turned)
+            self._infobar_dismissed.discard(str(dst))
+            self.open_pdf(str(dst), page=here)
+        finally:
+            QApplication.restoreOverrideCursor()
+        way = {90: "right", 270: "left", 180: "upside down"}.get(degrees % 360, "")
+        self.statusBar().showMessage(f"{page_names(turned)} turned {way} and saved in {dst.name}", 8000)
+
+    def rotate_range(self):
+        if not self.doc:
+            return
+        dlg = RotateDialog(self, self.doc.page_count, self.view.current_page())
+        if dlg.exec():
+            self.rotate(dlg.pages, dlg.degrees)
+
+    def _offer_reread(self):
+        """After a turn: the page's text layer still holds what was read before, so offer to read it again."""
+        if not self.doc:
+            return
+        pages = sorted(self._turned.get(self.doc_path, ()))
+        with LOCK:   # a page with its own (visible) text turned with that text; nothing to read again
+            pages = [p for p in pages if p < self.doc.page_count and not text_kinds(self.doc[p])[0]]
+        if not pages:
+            self._turned.pop(self.doc_path, None)
+            return
+        self._turned[self.doc_path] = set(pages)
+        one = len(pages) == 1
+        self.info_label.setText(
+            f"{page_names(pages)} {'was' if one else 'were'} turned. Read {'it' if one else 'them'} again so "
+            f"search and translation use the page the right way up.")
+        self.info_btn.setText("Read again (OCR)")
+        self._info_action = lambda: self.reread_pages(pages)
+        self.infobar.show()
+
+    def reread_pages(self, pages: list[int] | None = None):
+        """OCR pages again from scratch (default: the current one): the old text layer and any
+        translation made from it are taken off first."""
+        if not self.doc:
+            return
+        pages = [self.view.current_page()] if pages is None else list(pages)
+        with LOCK:
+            pages = [p for p in pages if 0 <= p < self.doc.page_count and not text_kinds(self.doc[p])[0]]
+            store = tr.load_translation(self.doc) or {"pages": {}}
+        if not pages:
+            QMessageBox.information(self, APP_NAME, "This page has its own text, so there is nothing to read again.")
+            return
+        translated = [p for p in pages if store["pages"].get(str(p), {}).get("units")]
+        if translated:
+            one = len(translated) == 1
+            ok = QMessageBox.question(
+                self, APP_NAME,
+                f"{page_names(translated)} {'has' if one else 'have'} an English translation made from the old "
+                f"reading.\n\nReading {'it' if one else 'them'} again removes that translation, so "
+                f"{'it' if one else 'they'} can be translated again from the new reading "
+                f"(Translate > Translate to English; that is charged like any other page).\n\nRead again?")
+            if ok != QMessageBox.StandardButton.Yes:
+                return
+        self._rereading = set(pages)
+        self._start_ocr([Path(self.doc_path)], force=True, pages=pages, fresh=True)
+        self._rereading = None   # still set here only if the job was cancelled or failed
 
     # ---- library ------------------------------------------------------------------
     def add_folder(self):
@@ -627,26 +781,8 @@ class MainWindow(QMainWindow):
             return
         page = self.view.current_page()
         dst, out = Path(res.dst), Path(res.output)
-        if out != dst:
-            # swap the finished file in; it may be the document that is open, so let go of it first
-            if self.search_worker and self.search_worker.isRunning():
-                self.search_worker.cancel()
-                self.search_worker.wait()
-            try:
-                with LOCK:
-                    if Path(self.doc_path) == dst:
-                        self.view.set_document(None)
-                        self.thumbs.set_document(None, "")
-                        self.doc.close()
-                        self.doc = None
-                    os.replace(out, dst)
-            except OSError as e:
-                QMessageBox.warning(self, APP_NAME, f"The translation is saved as\n{out}\nbut could not replace\n{dst}\n\n{e}")
-                return
-        try:
-            self.library.index_pdf(dst)
-        except Exception:
-            pass
+        if out != dst and not self._swap_in(out, dst):
+            return
         self.open_pdf(str(dst), page=page)
         QMessageBox.information(self, APP_NAME, res.message + (
             "\n\n" + "\n".join(f"Page {p + 1}: {why}" for p, why in res.failed[:12]) if res.failed else ""))

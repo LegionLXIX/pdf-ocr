@@ -29,27 +29,42 @@ AREA_DPI = 300   # resolution of snapshot images copied/saved from a dragged box
 
 
 class _RenderSignals(QObject):
-    done = Signal(int, float, QImage)
+    done = Signal(int, float, QImage, object)   # page, zoom, image, text colours (None unless text was erased)
 
 
 class _RenderJob(QRunnable):
     """Render one page at `zoom` logical scale for a screen with device pixel ratio `dpr`.
-    The image is rendered at zoom*dpr and tagged with the ratio, so it is sharp on HiDPI screens."""
+    The image is rendered at zoom*dpr and tagged with the ratio, so it is sharp on HiDPI screens.
 
-    def __init__(self, doc_path: str, page_no: int, zoom: float, signals: _RenderSignals, dpr: float = 1.0):
+    erase: [(box in page points, line height in points)] of text blocks to paint out of the picture,
+    for showing a translation in their place; the colours of the removed text come back with the image."""
+
+    def __init__(self, doc_path: str, page_no: int, zoom: float, signals: _RenderSignals, dpr: float = 1.0,
+                 erase: list | None = None):
         super().__init__()
         self.doc_path, self.page_no, self.zoom, self.signals, self.dpr = doc_path, page_no, zoom, signals, dpr
+        self.erase = erase
 
     def run(self):
         try:
             s = self.zoom * self.dpr
+            colors = None
             with LOCK:
                 doc = pymupdf.open(self.doc_path)
                 pix = doc[self.page_no].get_pixmap(matrix=pymupdf.Matrix(s, s), alpha=False)
-                img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
+                if self.erase:
+                    import numpy as np
+                    arr = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.stride)[:, :pix.width * 3]
+                    arr = np.array(arr).reshape(pix.height, pix.width, 3)   # a writable copy; the pixmap buffer is read-only
+                else:
+                    img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
                 doc.close()
+            if self.erase:   # the pixel work happens outside the lock
+                from .erase import erase_units
+                colors = erase_units(arr, [(tuple(v * s for v in box), line * s) for box, line in self.erase])
+                img = QImage(arr.data, arr.shape[1], arr.shape[0], arr.shape[1] * 3, QImage.Format.Format_RGB888).copy()
             img.setDevicePixelRatio(self.dpr)
-            self.signals.done.emit(self.page_no, self.zoom, img)
+            self.signals.done.emit(self.page_no, self.zoom, img, colors)
         except Exception:
             pass
 
@@ -62,6 +77,8 @@ class PdfView(QGraphicsView):
     copied = Signal(int)             # words copied to the clipboard
     area_copied = Signal(int, int)   # snapshot image copied to the clipboard (width, height in px)
     area_saved = Signal(str)         # snapshot image saved to this path
+    rotate_requested = Signal(int, int)   # page, degrees clockwise (from the right-click menu)
+    reread_requested = Signal(int)        # page to OCR again
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -97,6 +114,8 @@ class PdfView(QGraphicsView):
         self.zoom = 1.0
         self.fit_mode: str | None = None   # 'width' / 'page' keep fitting as the window resizes
         self.show_english = False                         # draw the stored translation over the page
+        self.overlay_boxes = False                        # True: plain white boxes; False: set into the page
+        self._unit_colors: dict[int, list] = {}           # page -> colour of each erased block's text
         self._translation: dict[int, list[dict]] = {}     # page -> translated units stored in the PDF
         self._overlay_items: dict[int, list[QGraphicsRectItem]] = {}
         self.page_items: list[QGraphicsPixmapItem] = []
@@ -122,7 +141,7 @@ class PdfView(QGraphicsView):
         self.rendered, self.pending = {}, set()
         self._words, self._selection, self._sel_items, self._anchor = {}, [], [], None
         self._area, self._area_item, self._area_anchor = None, None, None
-        self._translation, self._overlay_items = {}, {}
+        self._translation, self._overlay_items, self._unit_colors = {}, {}, {}
         self.doc, self.doc_path = doc, path
         if doc is None:
             return
@@ -173,14 +192,33 @@ class PdfView(QGraphicsView):
         dpr = self.devicePixelRatioF()
         visible = self._visible_pages()
         for i in visible:
-            if self.rendered.get(i) == (self.zoom, dpr) or i in self.pending:
+            spec = self._erase_spec(i)
+            if self.rendered.get(i) == (self.zoom, dpr, bool(spec)) or i in self.pending:
                 continue
             self.pending.add(i)
-            self.pool.start(_RenderJob(self.doc_path, i, self.zoom, self.signals, dpr))
+            self.pool.start(_RenderJob(self.doc_path, i, self.zoom, self.signals, dpr, spec))
         if self.show_english:
             for i in visible:
-                if i not in self._overlay_items:
+                # in-place English waits for its page picture (it needs the erased text's colours)
+                ready = self.overlay_boxes or self.rendered.get(i) == (self.zoom, dpr, bool(self._erase_spec(i)))
+                if i not in self._overlay_items and ready:
                     self._make_overlay(i)
+
+    def _english_units(self, page: int) -> list[dict]:
+        return [u for u in self._translation.get(page) or [] if (u.get("en") or "").strip()]
+
+    @staticmethod
+    def _line_pts(u: dict) -> float:
+        """Height of one line of a block's original text (width of one column when vertical), in points."""
+        b = u["bbox"]
+        n = max(1, (u.get("ja") or "").count("\n") + 1)
+        return ((b[2] - b[0]) if u.get("vertical") else (b[3] - b[1])) / n
+
+    def _erase_spec(self, page: int) -> list | None:
+        """What to paint out of a page's picture: its translated blocks, when English is shown in place."""
+        if not self.show_english or self.overlay_boxes:
+            return None
+        return [(tuple(u["bbox"]), self._line_pts(u)) for u in self._english_units(page)] or None
 
     # ---- English translation overlay ----------------------------------------------
     def set_translation(self, pages: dict[int, list[dict]] | None):
@@ -201,6 +239,16 @@ class PdfView(QGraphicsView):
         self.clear_selection()
         self._words = {}
         self._clear_overlays()
+        self.rendered = {}          # pages are redrawn with or without their Japanese
+        self._render_timer.start()
+
+    def set_overlay_boxes(self, boxes: bool):
+        """True: translation in plain white boxes over the page. False: set into the page in place."""
+        if boxes == self.overlay_boxes:
+            return
+        self.overlay_boxes = boxes
+        self._clear_overlays()
+        self.rendered = {}
         self._render_timer.start()
 
     def _clear_overlays(self):
@@ -210,17 +258,20 @@ class PdfView(QGraphicsView):
         self._overlay_items = {}
 
     def _make_overlay(self, page: int):
-        units = self._translation.get(page) or []
+        for it in self._overlay_items.get(page, []):
+            self.scene().removeItem(it)
+        units = self._english_units(page)
         self._overlay_items[page] = items = []
         if not units or page >= len(self.page_rects):
             return
         pr, z = self.page_rects[page], self.zoom
+        if not self.overlay_boxes:
+            self._make_inplace_overlay(page, units, items)
+            return
         with LOCK:
             page_rect = self.doc[page].rect
         for u in units:
-            en = (u.get("en") or "").strip()
-            if not en:
-                continue
+            en = u["en"].strip()
             r = english_rect(u["bbox"], page_rect, en)
             x, y, w, h = pr.x() + r.x0 * z, pr.y() + r.y0 * z, r.width * z, r.height * z
             box = QGraphicsRectItem()
@@ -252,6 +303,84 @@ class PdfView(QGraphicsView):
             self.scene().addItem(box)
             items.append(box)
 
+    def _make_inplace_overlay(self, page: int, units: list[dict], items: list):
+        """English set where the Japanese was: same place, the original's colour, as near its size as fits.
+        The Japanese itself has been painted out of the page picture by the render job."""
+        pr, z = self.page_rects[page], self.zoom
+        colors = self._unit_colors.get(page) or []
+        floor = 4.5 * z
+        laid = []   # per block: geometry, the text item, and the type size that fits it
+        for k, u in enumerate(units):
+            en = u["en"].strip()
+            b = u["bbox"]
+            x, y, w, h = pr.x() + b[0] * z, pr.y() + b[1] * z, (b[2] - b[0]) * z, (b[3] - b[1]) * z
+            box = QGraphicsRectItem(x, y, w, h)          # invisible; it carries the text and takes the clicks
+            box.setPen(QPen(Qt.PenStyle.NoPen))
+            box.setZValue(4)
+            text = QGraphicsTextItem(box)
+            text.setDefaultTextColor(QColor(*colors[k]) if k < len(colors) else QColor(20, 20, 20))
+            text.document().setDocumentMargin(0)
+            text.setPlainText(en)
+            text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
+                                         | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+            # a narrow vertical column: run the English down it, as the original runs
+            down = bool(u.get("vertical")) and h > 1.5 * w and w < 60 * z
+            length, room = (h, w) if down else (w, h)
+            # a one-line original (a heading, a label) stays on one line: English is often longer than
+            # its box, so it may run on to the right, up to the page edge, before it has to shrink
+            one_line = not down and "\n" not in (u.get("ja") or "") and "\n" not in en
+            reach = max(length, min(length * 2.4, pr.right() - x - 2 * z)) if one_line else length
+            font = QFont(self.font())
+
+            def fits(size: float) -> bool:
+                font.setPixelSize(max(1, int(round(size))))
+                text.setFont(font)
+                if one_line:
+                    text.setTextWidth(-1)
+                    return text.boundingRect().width() <= reach + 1
+                text.setTextWidth(max(10.0, length))
+                return text.boundingRect().height() <= room + 1
+
+            # start at the original's type size and shrink until the translation fits its block
+            size = min(self._line_pts(u) * z * 0.82, 48.0 * z)
+            while not fits(size) and size > floor:
+                size = max(floor, size * 0.93)
+            if one_line and not fits(size):     # still too long at the smallest size: let it wrap after all
+                one_line = False
+            laid.append({"u": u, "box": box, "text": text, "font": font, "size": size, "one_line": one_line,
+                         "down": down, "length": length, "geom": (x, y, w, h), "en": en})
+
+        # Paragraphs printed at one size should read at one size: blocks of running text whose originals
+        # had about the same line height all take the smallest size any of them needed.
+        body = sorted((d for d in laid if not d["one_line"] and not d["down"]), key=lambda d: self._line_pts(d["u"]))
+        group: list[dict] = []
+        for d in body + [None]:
+            if d is not None and (not group or self._line_pts(d["u"]) <= self._line_pts(group[0]["u"]) * 1.18):
+                group.append(d)
+                continue
+            if len(group) > 1:
+                common = min(g["size"] for g in group)
+                for g in group:
+                    g["size"] = max(common, g["size"] * 0.8)   # but never shrink one block by more than a fifth
+            group = [d] if d is not None else []
+
+        for d in laid:
+            box, text, font = d["box"], d["text"], d["font"]
+            x, y, w, h = d["geom"]
+            font.setPixelSize(max(1, int(round(d["size"]))))
+            text.setFont(font)
+            text.setTextWidth(-1 if d["one_line"] else max(10.0, d["length"]))
+            th = text.boundingRect().height()
+            if d["down"]:
+                text.setRotation(90)                      # local +x now points down the page
+                text.setPos(x + w - max(0.0, (w - th) / 2), y)
+            else:
+                centred = d["one_line"] or (th < h * 0.6 and "\n" not in d["en"])
+                text.setPos(x, y + max(0.0, (h - th) / 2) if centred else y)
+            box.text_item = text   # keep the Python object alive; without this the child is collected
+            self.scene().addItem(box)
+            items.append(box)
+
     def _overlay_text_at(self, view_pos) -> QGraphicsTextItem | None:
         it = self.itemAt(view_pos)
         if isinstance(it, QGraphicsTextItem):
@@ -272,12 +401,20 @@ class PdfView(QGraphicsView):
             fi.setTextCursor(c)
             self.scene().setFocusItem(None)
 
-    def _on_rendered(self, page_no: int, zoom: float, img: QImage):
+    def _on_rendered(self, page_no: int, zoom: float, img: QImage, colors=None):
         self.pending.discard(page_no)
         if zoom != self.zoom or page_no >= len(self.page_items):
+            self._render_timer.start()   # a picture for an old zoom; make sure the current one gets drawn
+            return
+        erased = colors is not None
+        if erased != bool(self._erase_spec(page_no)):
+            self._render_timer.start()   # English was switched on or off while this was being drawn
             return
         self.page_items[page_no].setPixmap(QPixmap.fromImage(img))   # keeps the image's device pixel ratio
-        self.rendered[page_no] = (zoom, img.devicePixelRatio())
+        self.rendered[page_no] = (zoom, img.devicePixelRatio(), erased)
+        if erased:
+            self._unit_colors[page_no] = colors
+            self._make_overlay(page_no)
         if img.devicePixelRatio() != self.devicePixelRatioF():
             self._render_timer.start()   # window moved to a screen with a different scale; redo
 
@@ -311,12 +448,20 @@ class PdfView(QGraphicsView):
         pr = self.page_rects[page_no]
         if rect is None:
             self.verticalScrollBar().setValue(int(pr.y() - GAP))
+            self._center_on_page(page_no)
         else:
             y = pr.y() + rect.y0 * self.zoom
             self.verticalScrollBar().setValue(int(y - self.viewport().height() * 0.3))
             x = pr.x() + rect.x0 * self.zoom
             self.horizontalScrollBar().setValue(int(x - self.viewport().width() * 0.3))
         self._render_timer.start()
+
+    def _center_on_page(self, page_no: int):
+        """In a book whose pages differ in width the scene is as wide as the widest one, so a narrower
+        page can sit off to one side. Bring it to the middle when all of it fits across the view."""
+        pr = self.page_rects[page_no]
+        if pr.width() <= self.viewport().width():
+            self.horizontalScrollBar().setValue(int(pr.center().x() - self.viewport().width() / 2))
 
     # ---- zoom ---------------------------------------------------------------------
     def set_zoom(self, zoom: float, fit: str | None = None):
@@ -338,6 +483,7 @@ class PdfView(QGraphicsView):
         self._draw_area()
         pr = self.page_rects[page]
         self.verticalScrollBar().setValue(int(pr.y() + frac * pr.height()))
+        self._center_on_page(page)
         self.zoom_changed.emit(zoom)
         self._render_timer.start()
 
@@ -747,6 +893,11 @@ class PdfView(QGraphicsView):
         a_clear = menu.addAction("Clear selection")
         a_clear.setEnabled(bool(self._selection))
         a_clear.triggered.connect(self.clear_selection)
+        if loc is not None:
+            menu.addSeparator()
+            menu.addAction("Rotate page right", lambda: self.rotate_requested.emit(loc[0], 90))
+            menu.addAction("Rotate page left", lambda: self.rotate_requested.emit(loc[0], 270))
+            menu.addAction("Read this page again (OCR)", lambda: self.reread_requested.emit(loc[0]))
         menu.exec(e.globalPos())
 
     def _select_range(self, a: tuple[int, int], b: tuple[int, int]):
@@ -881,7 +1032,7 @@ class ThumbnailList(QListWidget):
             it.setData(Qt.ItemDataRole.UserRole, True)
             self.pool.start(_RenderJob(self._path, i, self._zoom, self.signals, self.devicePixelRatioF()))
 
-    def _on_rendered(self, page_no: int, zoom: float, img: QImage):
+    def _on_rendered(self, page_no: int, zoom: float, img: QImage, _colors=None):
         if zoom != self._zoom or page_no >= self.count():
             return
         self.item(page_no).setIcon(QPixmap.fromImage(img))

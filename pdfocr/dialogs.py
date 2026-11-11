@@ -6,9 +6,10 @@ from pathlib import Path
 import pymupdf
 from PySide6.QtCore import QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import QIcon, QImageReader, QPixmap
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
-                               QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                               QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QVBoxLayout)
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+                               QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
+                               QSpinBox, QVBoxLayout)
 
 from . import translate as tr
 from .budget import MODEL_LABELS, Budget
@@ -25,6 +26,56 @@ def _line() -> QFrame:
     f.setFrameShape(QFrame.Shape.HLine)
     f.setFrameShadow(QFrame.Shadow.Sunken)
     return f
+
+
+# ---- rotate a range of pages ------------------------------------------------------------------------
+class RotateDialog(QDialog):
+    """Which pages to turn, and which way. `pages` (0-based) and `degrees` (clockwise) hold the answer."""
+
+    def __init__(self, parent, page_count: int, current_page: int):
+        super().__init__(parent)
+        self.setWindowTitle("Rotate pages")
+        self.page_count = page_count
+        self.pages: list[int] = []
+        self.degrees = 90
+        self.edit = QLineEdit(str(current_page + 1))
+        self.edit.setPlaceholderText("e.g. 9-15, 22")
+        self.edit.selectAll()
+        b_all = QPushButton("All pages")
+        b_all.clicked.connect(lambda: self.edit.setText(f"1-{page_count}"))
+        row = QHBoxLayout()
+        row.addWidget(self.edit, 1)
+        row.addWidget(b_all)
+        self.right = QRadioButton("Right (clockwise)")
+        self.left = QRadioButton("Left (anticlockwise)")
+        self.half = QRadioButton("Upside down (half turn)")
+        self.right.setChecked(True)
+        note = QLabel("The turn is saved in the book's working copy, \u201c<name> (OCR).pdf\u201d. "
+                      "The original file is not changed.")
+        note.setWordWrap(True)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Rotate")
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(f"Pages (this book has {page_count}):"))
+        lay.addLayout(row)
+        for w in (self.right, self.left, self.half, note, buttons):
+            lay.addWidget(w)
+        self.setMinimumWidth(380)
+
+    def _accept(self):
+        from .pdf_ocr import _parse_pages
+        try:
+            pages = sorted({p for p in _parse_pages(self.edit.text(), self.page_count) if 0 <= p < self.page_count})
+        except ValueError:
+            pages = []
+        if not pages:
+            QMessageBox.information(self, "Rotate pages", "Enter page numbers such as 9-15 or 3, 7.")
+            return
+        self.pages = pages
+        self.degrees = 90 if self.right.isChecked() else 270 if self.left.isChecked() else 180
+        self.accept()
 
 
 # ---- images -> PDF ----------------------------------------------------------------------------------
