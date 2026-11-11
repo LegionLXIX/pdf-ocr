@@ -136,35 +136,33 @@ def is_vertical(rect: pymupdf.Rect, text: str) -> bool:
     return len(text) >= 2 and rect.height > 1.5 * rect.width
 
 
-def write_invisible_line(page: pymupdf.Page, lr: pymupdf.Rect, text: str) -> bool:
+def write_invisible_line(page: pymupdf.Page, lr: pymupdf.Rect, text: str, run: int | None = None) -> bool:
     """Write one line of invisible text stretched over `lr` (unrotated page space).
 
     Surya 0.17 gives no usable per-word boxes, so a line is one string stretched to the line's length;
-    words then land roughly where they are on the scan. Vertical lines are written top to bottom.
+    words then land roughly where they are on the scan.
+    run: the direction the text runs in, in degrees clockwise from left-to-right: 0, 90 (top to bottom),
+    180 or 270 (bottom to top). None works it out from the box: a tall, narrow box runs top to bottom.
     """
     if lr.is_empty or lr.height < 1 or lr.width < 1:
         return False
+    if run is None:
+        run = 90 if is_vertical(lr, text) else 0
+    run = int(run) % 360
     font = _font_for(text)
-    tw = pymupdf.TextWriter(page.rect)
-    if is_vertical(lr, text):
-        fontsize = lr.width * 0.85
-        natural = font.text_length(text, fontsize=fontsize)
-        if natural <= 0:
-            return False
-        scale = max(0.3, min(3.0, lr.height / natural))
-        # rotate a quarter turn clockwise about the top of the column: the text then runs downward
-        origin = pymupdf.Point(lr.x0 + lr.width * 0.22, lr.y0)
-        tw.append(origin, text, font=font, fontsize=fontsize)
-        tw.write_text(page, render_mode=3, morph=(origin, pymupdf.Matrix(scale, 1) * pymupdf.Matrix(VERTICAL_ROTATION)))
-        return True
-    fontsize = lr.height * 0.85
+    thick, length = (lr.width, lr.height) if run in (90, 270) else (lr.height, lr.width)
+    fontsize = thick * 0.85
     natural = font.text_length(text, fontsize=fontsize)
     if natural <= 0:
         return False
-    scale = max(0.3, min(3.0, lr.width / natural))
-    origin = pymupdf.Point(lr.x0, lr.y1 - lr.height * 0.22)
+    scale = max(0.3, min(3.0, length / natural))
+    off = thick * 0.22                               # from the edge of the box to the baseline
+    origin = {0: pymupdf.Point(lr.x0, lr.y1 - off), 90: pymupdf.Point(lr.x0 + off, lr.y0),
+              180: pymupdf.Point(lr.x1, lr.y0 + off), 270: pymupdf.Point(lr.x1 - off, lr.y1)}[run]
+    tw = pymupdf.TextWriter(page.rect)
     tw.append(origin, text, font=font, fontsize=fontsize)
-    morph = (origin, pymupdf.Matrix(scale, 1)) if abs(scale - 1) > 0.02 else None
+    # Matrix(-90) is a quarter turn clockwise on the page (checked by the vertical-text test)
+    morph = (origin, pymupdf.Matrix(scale, 1) * pymupdf.Matrix(-run)) if (run or abs(scale - 1) > 0.02) else None
     tw.write_text(page, render_mode=3, morph=morph)  # 3 = invisible
     return True
 
@@ -185,8 +183,9 @@ def ocr_pdf(
 
     force reads pages again even when they have a text layer: the old layer is taken off first, and a
     page's English is written back from the translation stored in the file. fresh (with force) is for a
-    page whose old reading was wrong, such as one that was sideways: its translation is dropped as well,
-    so the page can be translated again from the new reading.
+    page that should be read anew, such as one that was turned: the new reading is merged with the
+    translation the page has (translate.apply_reading). What is translated stays; blocks that are new
+    wait for the next translation run.
 
     When `src` is already a working copy (dst == src) the new version is written beside it and then
     replaces it. replace=False leaves that new version in its ".part.pdf" file and returns that path,
@@ -230,10 +229,15 @@ def ocr_pdf(
         batch = todo[start:start + BATCH]
         with LOCK:
             rendered = [render_page(doc[i], dpi) for i in batch]
-        results = engine.ocr_images([im for im, _ in rendered])   # GPU work, outside the lock
+        results = engine.ocr_pages([im for im, _ in rendered])    # GPU work, outside the lock
         with LOCK:
             for i, (im, mat), res in zip(batch, rendered, results):
-                write_text_layer(doc[i], res, mat)
+                merged = None
+                if fresh and force:
+                    from . import translate as tr   # imported here: translate imports this module
+                    merged = tr.apply_reading(doc, dst, i, res, mat)
+                if merged is None:
+                    write_text_layer(doc[i], res, mat)
                 texts[i] = res.text
                 done += 1
         if progress:
@@ -242,9 +246,7 @@ def ocr_pdf(
     with LOCK:
         if force and todo:
             from . import translate as tr   # imported here: translate imports this module
-            if fresh:
-                tr.forget_pages(doc, dst, todo)
-            else:
+            if not fresh:
                 tr.restore_english(doc, stripped)
         if todo:
             meta = dict(doc.metadata or {})

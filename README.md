@@ -94,10 +94,15 @@ a new `ICON_NAME` in `make_icon.py` and run `register.py` again, or the old icon
   is saved straight away in the book's working copy, `<name> (OCR).pdf` (made from the original if there
   is none yet); the original is never modified and the scan is not re-compressed. The turn is written
   into the page itself, so a turned page behaves like any other page afterwards. A page's text layers
-  and translation boxes turn with it, but a scan that was read sideways was read badly, so a notice
-  offers **Read again (OCR)** for the pages you turned: that takes off their old text layer and any
-  translation made from it, and reads them upright. `Page > Read this page again (OCR)` does the same
-  for any page. Translate afterwards sends only those pages. Command line:
+  and its translation turn with it: every translated block stays on its spot of the page and is shown
+  lying turned, as the print now lies. That is what you want for a page with content facing different
+  ways, such as a row of cards scanned as one page with one card sideways: turn the page to read that
+  card, and the rest keeps its English. A notice then offers **Read again (OCR)** for the pages you
+  turned. Reading again merges: translations that are there stay, text that is the right way up now and
+  was not read before is added as blocks waiting for translation, and where an old sideways reading and
+  the new one cover the same spot, the more reliable reading wins (and keeps the English when the words
+  are the same). `Page > Read this page again (OCR)` does the same for any page. Translate afterwards
+  sends only the blocks that are waiting. Command line:
   `.venv\Scripts\python.exe -m pdfocr.pages "book.pdf" --rotate 9-15 [--left | --half]`
 - **Japanese OCR**: nothing to switch on. Surya reads Japanese as it reads English; lines with kana or
   kanji are written with a CJK font and vertical lines run top to bottom, so Japanese search lands on
@@ -118,9 +123,29 @@ place. The **English** toolbar button (E) shows the translation set into the pag
 painted out with the page's own background (a median fill around each block, `pdfocr/erase.py`), and the
 English is drawn where it was, in the original's colour and as near its size as fits; headings and labels
 stay on one line and paragraphs share a type size. Only the view changes; the PDF's page images are
-untouched, and switching English off shows the page as scanned. `Translate > Show the English in plain
-boxes` is the plainer alternative for pages where the in-place version is hard to read. With English on
-you can drag inside a block to select and copy it; with it off, selection works on the Japanese.
+untouched, and switching English off shows the page as scanned. Painting out only works where the print
+can be told from what is behind it. Over a drawing, or for heavy display lettering, the block is left as
+it is and the English stands on a small backing panel instead; handwriting and text the translator
+located by eye (below) are shown the same way, as labels turned to the slope of the writing. English
+wraps at whole words, text printed at one size reads at one size, and a block that would run into its
+neighbour shrinks or steps aside. `Translate > Show the English in plain boxes` is the plainer
+alternative. With English on you can drag inside a block to select and copy it; with it off, selection
+works on the Japanese.
+
+**What is read, and what is sent.** The unit of translation is a paragraph: neighbouring lines of one
+size (`pdfocr/units.py`), each stored in the PDF with its line boxes, its text, its English and the way
+it lies on the page. A very large page (a fold-out, several cards scanned as one) is read by the OCR a
+second time in overlapping tiles, because the text detector works on a reduced copy of the page and loses
+small print on such pages. A run sends only what is missing: all blocks of a page not seen before, or,
+after a page was read again, just the new ones, with a crop of the page around them (turned upright when
+the blocks lie turned).
+
+**Text the OCR cannot read.** Surya does not read slanted handwriting, and misses some text set over
+artwork. With *Also look for text the OCR could not read* ticked (the default), each page is shown to the
+translator once with everything already handled marked off, and it reports any other Japanese it can see:
+where it is, how it slopes, what it says, and the translation. Those pieces become labels on the page.
+This is one extra request per page (several for a very large page), made once; the dialog counts them
+in its estimate. Its boxes are placed by eye and are less exact than the OCR's.
 
 A glossary box lets you name the book and fix how names and terms are spelled; it is sent with every
 page so the translation stays consistent.
@@ -152,9 +177,9 @@ The ledger only knows about spending made through this app. For an independent s
 off in the Console's Billing page: Anthropic then refuses requests once the credits are gone, and the app
 stops cleanly when it sees that.
 
-**Never paying twice.** Each finished page is cached on disk as soon as it comes back and recorded
-inside the working copy. Stopping, hitting the limit or a crash loses nothing; running again sends only
-the pages that are still missing. You can translate a few pages first to see the quality and the real
+**Never paying twice.** Each answer is cached on disk as soon as it comes back and recorded inside the
+working copy. Stopping, hitting the limit or a crash loses nothing; running again sends only what is
+still missing. You can translate a few pages first to see the quality and the real
 cost per page (the estimate in the dialog uses your own history once there is some).
 
 Models: Claude Opus 5.5 by default, with Sonnet 5.5 (half the price) and Haiku 5.5 (cheapest) in the

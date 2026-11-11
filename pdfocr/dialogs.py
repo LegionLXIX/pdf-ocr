@@ -519,6 +519,12 @@ class TranslateDialog(QDialog):
 
         self.estimate = QLabel()
         self.estimate.setWordWrap(True)
+        self.sweep = QCheckBox("Also look for text the OCR could not read (handwriting, slanted or sideways text)")
+        self.sweep.setToolTip("The page picture is shown to the translator once more with what is already "
+                              "translated marked off, and it reports any Japanese it can see outside those "
+                              "blocks. One extra look per page (more on very large pages); pages that have had "
+                              "theirs are not sent again.")
+        self.sweep.setChecked(self.settings.value("tr_sweep", True, type=bool))
         self.budget_label = QLabel()
         self.budget_label.setWordWrap(True)
         self.bar = QProgressBar()
@@ -542,13 +548,15 @@ class TranslateDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel(f"<b>{Path(doc_path).name}</b>  →  {tr.output_path_for(Path(doc_path)).name}"))
         lay.addLayout(form)
+        lay.addWidget(self.sweep)
         lay.addWidget(_line())
         lay.addWidget(self.estimate)
         lay.addWidget(self.budget_label)
         lay.addWidget(self.bar)
         lay.addWidget(self.log)
         lay.addLayout(buttons)
-        for w in (self.pages.textChanged, self.model.currentIndexChanged, self.effort.currentIndexChanged):
+        for w in (self.pages.textChanged, self.model.currentIndexChanged, self.effort.currentIndexChanged,
+                  self.sweep.toggled):
             w.connect(self.refresh)
         self.refresh()
 
@@ -572,13 +580,16 @@ class TranslateDialog(QDialog):
             self.estimate.setText("Page range not understood. Use forms like 1-5, 12.")
             ready = False
         else:
-            todo = [p for p in pages if p not in self.done_pages]
-            low, high = tr.estimate_cost(self.doc, todo, model, self.budget)
+            sweep = self.sweep.isChecked()
+            todo = tr.pages_to_do(self.doc, pages, sweep)
+            requests = len(tr.request_sizes(self.doc, todo, sweep))
+            low, high = tr.estimate_cost(self.doc, todo, model, self.budget, sweep)
             scale = {"low": 1.0, "medium": 1.6, "high": 2.4}[self.effort.currentData()]
             based = "your recent pages" if self.budget.average_cost(model) is not None else "page size, before any page has been run"
             done = len(pages) - len(todo)
             self.estimate.setText(
-                f"{len(todo)} page(s) to translate" + (f" ({done} already done, free)" if done else "")
+                f"{len(todo)} page(s) with something to send" + (f", in {requests} requests" if requests != len(todo) else "")
+                + (f" ({done} complete, free)" if done else "")
                 + (f": roughly ${low * scale:.2f} to ${high * scale:.2f}, estimated from {based}. "
                    "The limit below is enforced whatever the estimate says." if todo else "."))
             if not todo:
@@ -608,8 +619,10 @@ class TranslateDialog(QDialog):
         self.settings.setValue("tr_model", self.model.currentData())
         self.settings.setValue("tr_effort", self.effort.currentData())
         self.settings.setValue("tr_glossary", self.glossary.toPlainText())
+        self.settings.setValue("tr_sweep", self.sweep.isChecked())
         self.worker = TranslateWorker(Path(self.doc_path), pages, self.model.currentData(), self.effort.currentData(),
-                                      self.glossary.toPlainText(), self.cap.value() or None, self.budget)
+                                      self.glossary.toPlainText(), self.cap.value() or None, self.budget,
+                                      sweep=self.sweep.isChecked())
         self.worker.progress.connect(self._progress)
         self.worker.done.connect(self._done)
         self.worker.failed.connect(self._failed)

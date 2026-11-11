@@ -624,8 +624,8 @@ class MainWindow(QMainWindow):
             self.open_pdf(out, page=self.view.current_page(), search=q)
         msg = f"OCR'd {n} page{'s' if n != 1 else ''} → {Path(out).name}"
         if reread and self.view.has_translation():
-            msg += (f"  ·  To translate {'it' if len(reread) == 1 else 'them'}: Translate > Translate to English "
-                    f"(pages already done are skipped)")
+            msg += ("  ·  What was translated is kept. For the text that is new: Translate > Translate to English "
+                    "(it sends only what is missing)")
         self.statusBar().showMessage(msg, 15000)
 
     # ---- turning pages --------------------------------------------------------------
@@ -676,15 +676,15 @@ class MainWindow(QMainWindow):
         self._turned[self.doc_path] = set(pages)
         one = len(pages) == 1
         self.info_label.setText(
-            f"{page_names(pages)} {'was' if one else 'were'} turned. Read {'it' if one else 'them'} again so "
-            f"search and translation use the page the right way up.")
+            f"{page_names(pages)} {'was' if one else 'were'} turned; what was translated turned with "
+            f"{'it' if one else 'them'}. Read {'it' if one else 'them'} again to pick up text that is now the right way up.")
         self.info_btn.setText("Read again (OCR)")
         self._info_action = lambda: self.reread_pages(pages)
         self.infobar.show()
 
     def reread_pages(self, pages: list[int] | None = None):
-        """OCR pages again from scratch (default: the current one): the old text layer and any
-        translation made from it are taken off first."""
+        """OCR pages again (default: the current one) and merge the new reading with what they have:
+        translations stay, text that is new waits for the next translation run."""
         if not self.doc:
             return
         pages = [self.view.current_page()] if pages is None else list(pages)
@@ -694,17 +694,6 @@ class MainWindow(QMainWindow):
         if not pages:
             QMessageBox.information(self, APP_NAME, "This page has its own text, so there is nothing to read again.")
             return
-        translated = [p for p in pages if store["pages"].get(str(p), {}).get("units")]
-        if translated:
-            one = len(translated) == 1
-            ok = QMessageBox.question(
-                self, APP_NAME,
-                f"{page_names(translated)} {'has' if one else 'have'} an English translation made from the old "
-                f"reading.\n\nReading {'it' if one else 'them'} again removes that translation, so "
-                f"{'it' if one else 'they'} can be translated again from the new reading "
-                f"(Translate > Translate to English; that is charged like any other page).\n\nRead again?")
-            if ok != QMessageBox.StandardButton.Yes:
-                return
         self._rereading = set(pages)
         self._start_ocr([Path(self.doc_path)], force=True, pages=pages, fresh=True)
         self._rereading = None   # still set here only if the job was cancelled or failed

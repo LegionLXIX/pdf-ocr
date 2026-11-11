@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QObject, QRectF, QRunnable, Qt, QThreadPool, Signal, QSize, QTimer
-from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPen, QPixmap, QPainter
+from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPen, QPixmap, QPainter, QTextOption
 from PySide6.QtWidgets import (QApplication, QFileDialog, QGraphicsItem, QGraphicsPixmapItem, QGraphicsRectItem,
                                QGraphicsScene, QGraphicsTextItem, QGraphicsView, QListWidget, QListWidgetItem,
                                QAbstractItemView, QMenu)
@@ -11,6 +11,7 @@ import pymupdf
 from .pdflock import LOCK
 from .textutil import clean_text
 from .translate import english_rect
+from .units import english_turn, hugs, line_thickness
 
 OVERLAY_FILL = QColor(255, 255, 255, 240)
 OVERLAY_PEN = QColor(70, 130, 200, 200)
@@ -36,8 +37,9 @@ class _RenderJob(QRunnable):
     """Render one page at `zoom` logical scale for a screen with device pixel ratio `dpr`.
     The image is rendered at zoom*dpr and tagged with the ratio, so it is sharp on HiDPI screens.
 
-    erase: [(box in page points, line height in points)] of text blocks to paint out of the picture,
-    for showing a translation in their place; the colours of the removed text come back with the image."""
+    erase: [(block number, its line boxes in page points, line height in points)] of the text blocks
+    to paint out of the picture, for showing a translation in their place. What was found comes back
+    with the image as {block number: {"color", "bg", "plate"}} (see erase.erase_unit)."""
 
     def __init__(self, doc_path: str, page_no: int, zoom: float, signals: _RenderSignals, dpr: float = 1.0,
                  erase: list | None = None):
@@ -60,8 +62,9 @@ class _RenderJob(QRunnable):
                     img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
                 doc.close()
             if self.erase:   # the pixel work happens outside the lock
-                from .erase import erase_units
-                colors = erase_units(arr, [(tuple(v * s for v in box), line * s) for box, line in self.erase])
+                from .erase import erase_unit
+                colors = {k: erase_unit(arr, [tuple(v * s for v in box) for box in boxes], line * s)
+                          for k, boxes, line in self.erase}
                 img = QImage(arr.data, arr.shape[1], arr.shape[0], arr.shape[1] * 3, QImage.Format.Format_RGB888).copy()
             img.setDevicePixelRatio(self.dpr)
             self.signals.done.emit(self.page_no, self.zoom, img, colors)
@@ -214,11 +217,36 @@ class PdfView(QGraphicsView):
         n = max(1, (u.get("ja") or "").count("\n") + 1)
         return ((b[2] - b[0]) if u.get("vertical") else (b[3] - b[1])) / n
 
+    def _label_mode(self, page: int, u: dict) -> bool:
+        """Is this block shown as a label laid over the page, with nothing painted out? That is the way
+        for text whose box does not mark the printing itself: slanted handwriting, a region the OCR was
+        unsure of, text the translator located by eye, and blocks stored by earlier versions of the app
+        that took in a large part of the page."""
+        if u.get("loose") or u.get("src") == "found":
+            return True
+        if u.get("lines"):
+            return False
+        b = u["bbox"]
+        w, h = b[2] - b[0], b[3] - b[1]
+        if page < len(self.page_rects):
+            pr = self.page_rects[page]
+            if w * h * self.zoom * self.zoom > 0.22 * pr.width() * pr.height():
+                return True
+        rows = (u.get("ja") or "").split("\n")
+        down = bool(u.get("vertical")) != (int(u.get("angle") or 0) % 180 == 90)
+        thick, length = (w / len(rows), h) if down else (h / len(rows), w)
+        return not hugs(max(rows, key=len), length, thick)
+
     def _erase_spec(self, page: int) -> list | None:
-        """What to paint out of a page's picture: its translated blocks, when English is shown in place."""
+        """What to paint out of a page's picture: the printed lines of its translated blocks, when English
+        is shown in place. Blocks shown as labels are left alone."""
         if not self.show_english or self.overlay_boxes:
             return None
-        return [(tuple(u["bbox"]), self._line_pts(u)) for u in self._english_units(page)] or None
+        spec = []
+        for k, u in enumerate(self._english_units(page)):
+            if not self._label_mode(page, u):
+                spec.append((k, [tuple(l) for l in (u.get("lines") or [u["bbox"]])], line_thickness(u)))
+        return spec or None
 
     # ---- English translation overlay ----------------------------------------------
     def set_translation(self, pages: dict[int, list[dict]] | None):
@@ -304,79 +332,191 @@ class PdfView(QGraphicsView):
             items.append(box)
 
     def _make_inplace_overlay(self, page: int, units: list[dict], items: list):
-        """English set where the Japanese was: same place, the original's colour, as near its size as fits.
-        The Japanese itself has been painted out of the page picture by the render job."""
+        """English set where the Japanese was: same place, the original's colour, as near its size as fits,
+        lying the way the block lies on the page. Where the Japanese could be painted out of the page
+        picture (the render job did that) the English stands on the page itself; where it could not
+        (text over artwork, heavy lettering, handwriting) the English stands on a backing panel."""
         pr, z = self.page_rects[page], self.zoom
-        colors = self._unit_colors.get(page) or []
+        seen = self._unit_colors.get(page) or {}
         floor = 4.5 * z
-        laid = []   # per block: geometry, the text item, and the type size that fits it
+        wrap = QTextOption.WrapMode.WordWrap
+        geo = []
+        for u in units:
+            b = u["bbox"]
+            geo.append(QRectF(pr.x() + b[0] * z, pr.y() + b[1] * z, (b[2] - b[0]) * z, (b[3] - b[1]) * z))
+        # the size ordinary text on this page is printed at: labels over handwriting are set at that size
+        thick = sorted(line_thickness(u) for u in units if not self._label_mode(page, u))
+        body = (thick[len(thick) // 2] * 0.82 if thick else 10.0) * z
+
+        def free_right(k: int) -> float:
+            """How far block k's line may run on to the right before it meets another block or the edge."""
+            r, limit = geo[k], pr.right() - 3 * z
+            for j, o in enumerate(geo):
+                if j != k and o.left() >= r.right() - 1 and o.top() < r.bottom() and o.bottom() > r.top():
+                    limit = min(limit, o.left() - 2 * z)
+            return max(r.width(), limit - r.left())
+
+        laid = []
         for k, u in enumerate(units):
             en = u["en"].strip()
-            b = u["bbox"]
-            x, y, w, h = pr.x() + b[0] * z, pr.y() + b[1] * z, (b[2] - b[0]) * z, (b[3] - b[1]) * z
-            box = QGraphicsRectItem(x, y, w, h)          # invisible; it carries the text and takes the clicks
+            r = geo[k]
+            x, y, w, h = r.x(), r.y(), r.width(), r.height()
+            label = self._label_mode(page, u)
+            info = seen.get(k) or {}
+            angle = float(u.get("angle") or 0) % 360
+            quarter = int(round(angle / 90.0)) * 90 % 360
+            box = QGraphicsRectItem(r)                    # carries the text and takes the clicks
             box.setPen(QPen(Qt.PenStyle.NoPen))
             box.setZValue(4)
             text = QGraphicsTextItem(box)
-            text.setDefaultTextColor(QColor(*colors[k]) if k < len(colors) else QColor(20, 20, 20))
             text.document().setDocumentMargin(0)
+            opt = text.document().defaultTextOption()
+            opt.setWrapMode(wrap)
+            text.document().setDefaultTextOption(opt)
             text.setPlainText(en)
             text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
                                          | Qt.TextInteractionFlag.TextSelectableByKeyboard)
-            # a narrow vertical column: run the English down it, as the original runs
-            down = bool(u.get("vertical")) and h > 1.5 * w and w < 60 * z
-            length, room = (h, w) if down else (w, h)
-            # a one-line original (a heading, a label) stays on one line: English is often longer than
-            # its box, so it may run on to the right, up to the page edge, before it has to shrink
-            one_line = not down and "\n" not in (u.get("ja") or "") and "\n" not in en
-            reach = max(length, min(length * 2.4, pr.right() - x - 2 * z)) if one_line else length
             font = QFont(self.font())
+            d = {"u": u, "k": k, "box": box, "text": text, "font": font, "en": en, "geom": (x, y, w, h),
+                 "label": label, "plate": label or bool(info.get("plate")), "info": info}
 
-            def fits(size: float) -> bool:
+            def set_size(size: float, width: float):
                 font.setPixelSize(max(1, int(round(size))))
                 text.setFont(font)
+                text.setTextWidth(width)
+
+            if label:
+                # a label: ordinary reading size, as wide as it needs up to a comfortable measure
+                turn = angle if u.get("src") == "found" else float(quarter)
+                along = h if int(round(turn / 90.0)) % 2 else w
+                measure = max(90 * z, min(max(along, 150 * z), 330 * z))
+                size = max(8.5 * z, min(body, 14 * z))
+                set_size(size, -1)
+                if text.boundingRect().width() > measure:
+                    set_size(size, measure)
+                d.update(size=size, width=text.textWidth(), rot=turn, one_line=False, length=along)
+                laid.append(d)
+                continue
+            # along the block as ordinary text, down a narrow vertical column, and turned with the page
+            rot = english_turn(u)
+            length, room = (h, w) if rot in (90, 270) else (w, h)
+            # a one-line original (a heading, a caption) stays on one line: English is often longer than
+            # its box, so it may run on into free space before it has to shrink
+            one_line = "\n" not in (u.get("ja") or "") and "\n" not in en
+            reach = max(length, min(length * 2.2, free_right(k))) if (one_line and rot == 0) else length
+
+            def fits(size: float) -> bool:
                 if one_line:
-                    text.setTextWidth(-1)
+                    set_size(size, -1)
                     return text.boundingRect().width() <= reach + 1
-                text.setTextWidth(max(10.0, length))
-                return text.boundingRect().height() <= room + 1
+                set_size(size, max(10.0, length))
+                # whole words only: a word wider than the block means the type is still too large
+                return text.boundingRect().height() <= room + 1 and text.document().idealWidth() <= length + 1
 
             # start at the original's type size and shrink until the translation fits its block
-            size = min(self._line_pts(u) * z * 0.82, 48.0 * z)
+            size = min(line_thickness(u) * z * 0.82, 48.0 * z)
             while not fits(size) and size > floor:
                 size = max(floor, size * 0.93)
             if one_line and not fits(size):     # still too long at the smallest size: let it wrap after all
                 one_line = False
-            laid.append({"u": u, "box": box, "text": text, "font": font, "size": size, "one_line": one_line,
-                         "down": down, "length": length, "geom": (x, y, w, h), "en": en})
+            d.update(size=size, rot=float(rot), one_line=one_line, length=length, room=room, reach=reach)
+            laid.append(d)
 
-        # Paragraphs printed at one size should read at one size: blocks of running text whose originals
-        # had about the same line height all take the smallest size any of them needed.
-        body = sorted((d for d in laid if not d["one_line"] and not d["down"]), key=lambda d: self._line_pts(d["u"]))
+        # Text printed at one size should read at one size: blocks whose originals had about the same
+        # line height all take the smallest size any of them needed (but none shrinks by more than a fifth).
+        plain = sorted((d for d in laid if not d["label"]), key=lambda d: line_thickness(d["u"]))
         group: list[dict] = []
-        for d in body + [None]:
-            if d is not None and (not group or self._line_pts(d["u"]) <= self._line_pts(group[0]["u"]) * 1.18):
+        for d in plain + [None]:
+            if d is not None and (not group or line_thickness(d["u"]) <= line_thickness(group[0]["u"]) * 1.18):
                 group.append(d)
                 continue
             if len(group) > 1:
                 common = min(g["size"] for g in group)
                 for g in group:
-                    g["size"] = max(common, g["size"] * 0.8)   # but never shrink one block by more than a fifth
+                    g["size"] = max(common, g["size"] * 0.8)
             group = [d] if d is not None else []
 
-        for d in laid:
-            box, text, font = d["box"], d["text"], d["font"]
+        def place(d: dict):
+            """Set the block's text at its size and put it in position; returns the area it covers."""
+            text, font = d["text"], d["font"]
             x, y, w, h = d["geom"]
             font.setPixelSize(max(1, int(round(d["size"]))))
             text.setFont(font)
+            if d["label"]:
+                text.setTextWidth(-1)
+                if text.boundingRect().width() > d["width"] > 0:
+                    text.setTextWidth(d["width"])
+                br = text.boundingRect()
+                text.setTransformOriginPoint(br.center())
+                text.setRotation(d["rot"])
+                big = w * h > 0.22 * pr.width() * pr.height()
+                cx, cy = (x + br.width() / 2 + 6 * z, y + br.height() / 2 + 6 * z) if big else (x + w / 2, y + h / 2)
+                text.setPos(cx - br.width() / 2, cy - br.height() / 2)
+                return text.sceneBoundingRect()
             text.setTextWidth(-1 if d["one_line"] else max(10.0, d["length"]))
-            th = text.boundingRect().height()
-            if d["down"]:
-                text.setRotation(90)                      # local +x now points down the page
-                text.setPos(x + w - max(0.0, (w - th) / 2), y)
+            br = text.boundingRect()
+            th, rot = br.height(), int(d["rot"])
+            centred = d["one_line"] or (th < d["room"] * 0.6 and "\n" not in d["en"])
+            slack = max(0.0, (d["room"] - th) / 2) if centred else 0.0
+            text.setTransformOriginPoint(0, 0)
+            text.setRotation(rot)
+            if rot == 90:                               # local +x points down the page
+                text.setPos(x + w - slack, y)
+            elif rot == 270:                            # local +x points up the page
+                text.setPos(x + slack, y + h)
+            elif rot == 180:
+                text.setPos(x + w, y + h - slack)
             else:
-                centred = d["one_line"] or (th < h * 0.6 and "\n" not in d["en"])
-                text.setPos(x, y + max(0.0, (h - th) / 2) if centred else y)
+                text.setPos(x, y + slack)
+            return text.sceneBoundingRect()
+
+        # Larger type first. A block that would run into one already placed gives way: a label steps
+        # down below it, other text shrinks, though not so far that it can no longer be read.
+        placed: list[QRectF] = []
+        for d in sorted(laid, key=lambda d: (d["label"], -d["size"])):
+            area = place(d)
+            hit = lambda a: next((p for p in placed if a.adjusted(1, 1, -1, -1).intersects(p)), None)
+            if d["label"]:
+                for _ in range(8):
+                    p = hit(area)
+                    if p is None or p.bottom() + area.height() > pr.bottom():
+                        break
+                    d["text"].moveBy(0, p.bottom() + 3 * z - area.top())
+                    area = d["text"].sceneBoundingRect()
+            else:
+                least = max(floor, d["size"] * 0.72)
+                while d["size"] > least and hit(area) is not None:
+                    d["size"] = max(least, d["size"] * 0.93)
+                    area = place(d)
+            placed.append(area)
+            d["area"] = area
+
+        for d in laid:
+            box, text, info = d["box"], d["text"], d["info"]
+            color = QColor(*info["color"]) if info.get("color") else QColor(20, 20, 20)
+            if d["plate"]:
+                # a panel behind the English, in the colour of what is behind the text where that is known
+                bg = QColor(*info["bg"]) if info.get("bg") else QColor(255, 255, 255)
+                light = bg.lightnessF() >= 0.5
+                panel = QColor(bg).lighter(108) if light else QColor(bg).darker(115)
+                panel.setAlpha(236)
+                if abs(color.lightnessF() - panel.lightnessF()) < 0.42:
+                    color = QColor(20, 20, 20) if light else QColor(245, 245, 245)
+                m = 2.5 * self.zoom
+                cover = d["area"].adjusted(-m, -m, m, m)
+                if not d["label"]:
+                    cover = cover.united(box.rect())      # hide the Japanese it replaces
+                if d["label"] and d["rot"] % 90:
+                    # a slanted label: the panel turns with the writing
+                    br = text.boundingRect().adjusted(-m, -m, m, m)
+                    plate = QGraphicsRectItem(br, text)
+                    plate.setFlag(QGraphicsItem.GraphicsItemFlag.ItemStacksBehindParent, True)
+                    plate.setPen(QPen(Qt.PenStyle.NoPen))
+                    plate.setBrush(QBrush(panel))
+                else:
+                    box.setRect(cover)
+                    box.setBrush(QBrush(panel))
+            text.setDefaultTextColor(color)
             box.text_item = text   # keep the Python object alive; without this the child is collected
             self.scene().addItem(box)
             items.append(box)

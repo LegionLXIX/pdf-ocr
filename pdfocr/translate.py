@@ -26,6 +26,7 @@ import os
 import sys
 import threading
 import time
+import copy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +41,7 @@ from .pdf_ocr import (DEFAULT_DPI, OCR_MARKER, _font_for, isolate_content, page_
 from .pdf_ocr import output_path_for as working_copy_for
 from .pdflock import LOCK
 from .textutil import clean_text
+from .units import build_units, cover, english_turn, inter, merge_reading, turn_unit, union
 
 DEFAULT_MODEL = "claude-opus-5-5"
 DEFAULT_EFFORT = "low"        # translation needs little deliberation; raise it in the dialog for hard pages
@@ -75,7 +77,21 @@ the OCR misread it.
 - If a block is not text (OCR noise, a bare page number, a decorative pattern) or cannot be read at all in \
 the image, return an empty string for it.
 
-Return every block id exactly once."""
+Return every block id exactly once.
+
+Missed text. When the request asks for it, also look over the image for Japanese text that no block covers: \
+handwritten notes, slanted or curved captions, text printed sideways or upside down, labels on drawings, text \
+set over artwork. Report each piece in "found", one entry per caption, note or paragraph, with:
+- "box": the smallest upright rectangle that contains it, as [left, top, right, bottom] in thousandths of the \
+image's width and height. Be exact: the translation is placed by this box.
+- "angle": how far its reading direction is turned clockwise from ordinary left-to-right text, in degrees: 0 \
+for normal horizontal text, 90 for text that runs top to bottom with its letters lying on their side, about \
+20 for a note that slopes down to the right, about 340 for one that slopes up to the right.
+- "vertical": true for vertical Japanese text (upright characters stacked top to bottom; its angle is 0).
+- "ja": the text as written. "en": its translation, under the rules above.
+Leave out text that lies inside a block's box or inside a region listed as already handled, text that is \
+already in English, and decoration that only looks like writing. When the request does not ask for missed \
+text, or there is none, "found" is an empty list."""
 
 SCHEMA = {
     "type": "object",
@@ -88,9 +104,19 @@ SCHEMA = {
                 "required": ["id", "en"],
                 "additionalProperties": False,
             },
-        }
+        },
+        "found": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"box": {"type": "array", "items": {"type": "integer"}}, "angle": {"type": "integer"},
+                               "vertical": {"type": "boolean"}, "ja": {"type": "string"}, "en": {"type": "string"}},
+                "required": ["box", "angle", "vertical", "ja", "en"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["blocks"],
+    "required": ["blocks", "found"],
     "additionalProperties": False,
 }
 
@@ -141,20 +167,12 @@ def check_credentials(client=None) -> tuple[bool, str]:
 
 # ---- data -------------------------------------------------------------------------------------------
 @dataclass
-class Unit:
-    """One block of text to translate. `bbox` is in page points as displayed."""
-    id: int
-    bbox: tuple[float, float, float, float]
-    ja: str
-    vertical: bool = False
-    en: str = ""
-
-
-@dataclass
 class TranslateResult:
     dst: Path
     output: Path | None = None        # the written file: `dst`, or a temp file to swap in when replace=False
     translated: int = 0               # pages sent to Claude this run
+    blocks: int = 0                   # blocks of text translated this run
+    found: int = 0                    # pieces of text the translator located itself (the OCR had missed them)
     from_cache: int = 0               # pages reused from the on-disk cache (free)
     already_done: int = 0             # pages the output file already had
     empty: int = 0                    # pages with no text
@@ -216,24 +234,76 @@ def restore_english(doc: pymupdf.Document, pages: list[int]):
         page = doc[p]
         isolate_content(page)
         for u in entry.get("units", []):
-            if u.get("en", "").strip():
-                write_invisible_box(page, english_rect(u["bbox"], page.rect, u["en"]), u["en"])
+            write_unit_layers(page, u, japanese=u.get("src") == "found")
 
 
-def turn_units(doc: pymupdf.Document, dst: Path, page: int, display_map: pymupdf.Matrix) -> bool:
-    """A page was turned: move its stored translation boxes with it (`display_map` takes a point of the
-    page as it was displayed to where it is displayed now). A stored page with no blocks is dropped."""
+def write_unit_layers(page: pymupdf.Page, u: dict, japanese: bool = True):
+    """The invisible text of one translated unit: its Japanese on its printed lines and its English over
+    the block, both lying the way the unit lies on the page (see units.py for "angle")."""
+    angle = int(round((u.get("angle") or 0) / 90.0)) * 90 % 360
+    derot = page.derotation_matrix
+    ja = (u.get("ja") or "").strip()
+    if japanese and ja:
+        run = (angle + (90 if u.get("vertical") else 0)) % 360
+        texts, boxes = ja.split("\n"), u.get("lines") or []
+        if len(boxes) != len(texts):
+            texts, boxes = [" ".join(texts)], [u["bbox"]]
+        for box, text in zip(boxes, texts):
+            r = pymupdf.Rect(*box) * derot
+            r.normalize()
+            write_invisible_line(page, r, text, run)
+    en = (u.get("en") or "").strip()
+    if en:
+        turn = english_turn(u)
+        rect = english_rect(u["bbox"], page.rect, en) if turn == 0 else pymupdf.Rect(*u["bbox"])
+        write_invisible_box(page, rect, en, turn)
+
+
+def apply_reading(doc: pymupdf.Document, dst: Path, pno: int, ocr, mat: pymupdf.Matrix) -> tuple[int, int] | None:
+    """A translated page was read again by the OCR (its old text layers already taken off). Merge the
+    new reading into what the page has and write its text layers. Translations stay; blocks that are new
+    wait as "pending" for the next translation run, which sends only those.
+
+    Returns (units kept, units waiting), or None when the page has no stored translation, in which case
+    the caller writes an ordinary OCR layer."""
+    _cache_forget(dst, pno)
+    store = load_translation(doc)
+    if not store or str(pno) not in store["pages"]:
+        return None
+    page = doc[pno]
+    entry, kept, waiting = merge_reading(store["pages"][str(pno)], build_units(ocr, ~mat), abs(page.rect))
+    store["pages"][str(pno)] = entry
+    save_translation(doc, store)
+    isolate_content(page)
+    to_display, to_page = ~mat, ~mat * page.derotation_matrix
+    boxes = [u["bbox"] for u in entry["units"]]
+    for block in ocr.blocks:
+        min_conf = 0.5 if block.label in ("Picture", "Figure") else 0.0
+        for line in block.lines:
+            if not line.text or line.confidence < min_conf:
+                continue
+            c = pymupdf.Rect(*line.bbox) * to_display
+            cx, cy = (c.x0 + c.x1) / 2, (c.y0 + c.y1) / 2
+            if any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in boxes):
+                continue                      # a kept unit covers this spot and brings its own text
+            r = pymupdf.Rect(*line.bbox) * to_page
+            r.normalize()
+            write_invisible_line(page, r, line.text)
+    for u in entry["units"]:
+        write_unit_layers(page, u)
+    return kept, waiting
+
+
+def turn_units(doc: pymupdf.Document, dst: Path, page: int, display_map: pymupdf.Matrix, degrees: int = 0) -> bool:
+    """A page was turned `degrees` clockwise: its stored translation turns with it and stays in place on
+    the page (`display_map` takes a point of the page as it was displayed to where it is displayed now)."""
     _cache_forget(dst, page)     # the cache holds positions from before the turn
     store = load_translation(doc)
     if not store or str(page) not in store["pages"]:
         return False
-    units = store["pages"][str(page)].get("units", [])
-    if not units:
-        del store["pages"][str(page)]
-    for u in units:
-        r = pymupdf.Rect(*u["bbox"]) * display_map
-        r.normalize()
-        u["bbox"] = [r.x0, r.y0, r.x1, r.y1]
+    entry = store["pages"][str(page)]
+    for key in ("units", "pending"):
+        entry[key] = [turn_unit(u, display_map, degrees) for u in entry.get(key, [])]
     save_translation(doc, store)
     return True
 
@@ -251,41 +321,6 @@ def english_rect(bbox, page_rect: pymupdf.Rect, text: str) -> pymupdf.Rect:
     dx = max(0.0, page_rect.x0 - r.x0) - max(0.0, r.x1 - page_rect.x1)
     dy = max(0.0, page_rect.y0 - r.y0) - max(0.0, r.y1 - page_rect.y1)
     return pymupdf.Rect(r.x0 + dx, r.y0 + dy, r.x1 + dx, r.y1 + dy)
-
-
-# ---- OCR blocks -> units ----------------------------------------------------------------------------
-def _is_text(s: str) -> bool:
-    return any(ch.isalpha() for ch in s)
-
-
-def build_units(ocr, to_page: pymupdf.Matrix) -> list[Unit]:
-    """Turn OCR layout blocks into translation units: a paragraph block is one unit; text sitting in a
-    picture, a table or outside any block is one unit per line (labels and cells translate separately)."""
-    units: list[Unit] = []
-
-    def add(lines):
-        lines = [l for l in lines if l.text and _is_text(l.text)]
-        if not lines:
-            return
-        vert = [(l.bbox[3] - l.bbox[1]) > 1.5 * (l.bbox[2] - l.bbox[0]) and len(l.text) >= 2 for l in lines]
-        vertical = sum(vert) * 2 > len(lines)
-        if vertical:   # columns read right to left
-            lines = sorted(lines, key=lambda l: (-l.bbox[0], l.bbox[1]))
-        x0 = min(l.bbox[0] for l in lines); y0 = min(l.bbox[1] for l in lines)
-        x1 = max(l.bbox[2] for l in lines); y1 = max(l.bbox[3] for l in lines)
-        r = pymupdf.Rect(x0, y0, x1, y1) * to_page
-        r.normalize()
-        units.append(Unit(len(units), (r.x0, r.y0, r.x1, r.y1), "\n".join(l.text for l in lines), vertical))
-
-    for block in ocr.blocks:
-        whole_page = (block.bbox[2] - block.bbox[0]) >= ocr.width * 0.98 and (block.bbox[3] - block.bbox[1]) >= ocr.height * 0.98
-        lines = [l for l in block.lines if l.confidence >= (0.5 if block.label in ("Picture", "Figure") else 0.0)]
-        if whole_page or block.label in ("Picture", "Figure", "Table"):
-            for l in lines:
-                add([l])
-        else:
-            add(lines)
-    return units
 
 
 # ---- the request ------------------------------------------------------------------------------------
@@ -310,17 +345,143 @@ def image_for_api(im: Image.Image) -> tuple[str, int]:
     return base64.standard_b64encode(buf.getvalue()).decode("ascii"), math.ceil(im.width / 28) * math.ceil(im.height / 28)
 
 
-def build_request(model: str, effort: str, glossary: str, image_b64: str, units: list[Unit],
-                  page_rect: pymupdf.Rect) -> dict:
+# A request shows the model one region of a page. The region is turned when its blocks lie turned on the
+# page, so that the text to translate is always the right way up in the image.
+SPLIT_PX = 4400      # a region longer than this (at 200 dpi) is sent in pieces: at the API's image size its
+PIECE_PX = 3000      # small print would otherwise be too reduced to read
+
+
+@dataclass
+class Job:
+    """One request: translate `units` (blocks waiting on a page) as seen in `region`, and, when `sweep`
+    is set, report text in the region that no block covers."""
+    page: int
+    region: tuple[float, float, float, float]      # page points, as displayed
+    turn: int                                      # the image is turned back by this much (0, 90, 180, 270)
+    units: list[dict]
+    known: list[list[float]]                       # boxes already handled, for the missed-text pass
+    sweep: bool
+
+    def key(self, model: str, effort: str, glossary: str) -> str:
+        blob = json.dumps([model, effort, glossary, [round(v, 1) for v in self.region], self.turn, self.sweep,
+                           [[u["ja"], [round(v, 1) for v in u["bbox"]]] for u in self.units],
+                           sorted([round(v) for v in b] for b in self.known)], ensure_ascii=False)
+        return f"p{self.page:05d}_j{hashlib.sha1(blob.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _turned(turn: int, u: float, v: float) -> tuple[float, float]:
+    """A point of a region (0-1 across and down) in the image after the image was turned back by `turn`."""
+    return {0: (u, v), 90: (v, 1 - u), 180: (1 - u, 1 - v), 270: (1 - v, u)}[turn]
+
+
+def box_to_image(b, region, turn: int) -> list[int]:
+    """A box in page points as [left, top, right, bottom] in thousandths of the request image."""
+    w, h = region[2] - region[0], region[3] - region[1]
+    pts = [_turned(turn, (x - region[0]) / w, (y - region[1]) / h) for x, y in ((b[0], b[1]), (b[2], b[3]))]
+    xs, ys = sorted(p[0] for p in pts), sorted(p[1] for p in pts)
+    clamp = lambda v: max(0, min(1000, round(1000 * v)))
+    return [clamp(xs[0]), clamp(ys[0]), clamp(xs[1]), clamp(ys[1])]
+
+
+def box_from_image(box, region, turn: int) -> list[float]:
+    """The inverse of box_to_image."""
+    w, h = region[2] - region[0], region[3] - region[1]
+    back = (360 - turn) % 360
+    pts = [_turned(back, x / 1000.0, y / 1000.0) for x, y in ((box[0], box[1]), (box[2], box[3]))]
+    xs, ys = sorted(p[0] for p in pts), sorted(p[1] for p in pts)
+    return [region[0] + xs[0] * w, region[1] + ys[0] * h, region[0] + xs[1] * w, region[1] + ys[1] * h]
+
+
+def _pieces(region) -> list[tuple[float, float, float, float]]:
+    """A region as one piece, or as overlapping pieces when it is too large to send whole."""
+    px = DEFAULT_DPI / 72.0
+
+    def spans(a: float, b: float) -> list[tuple[float, float]]:
+        length = (b - a) * px
+        if length <= SPLIT_PX:
+            return [(a, b)]
+        n = math.ceil(length / PIECE_PX)
+        size = (b - a) / n
+        lap = size * 0.06
+        return [(max(a, a + k * size - lap), min(b, a + (k + 1) * size + lap)) for k in range(n)]
+
+    return [(x0, y0, x1, y1) for y0, y1 in spans(region[1], region[3]) for x0, x1 in spans(region[0], region[2])]
+
+
+def _home(u: dict, pieces: list) -> int:
+    """The piece a block belongs to: the one its centre sits deepest inside."""
+    cx, cy = (u["bbox"][0] + u["bbox"][2]) / 2, (u["bbox"][1] + u["bbox"][3]) / 2
+    depth = lambda p: min(cx - p[0], p[2] - cx, cy - p[1], p[3] - cy)
+    return max(range(len(pieces)), key=lambda k: depth(pieces[k]))
+
+
+def _snap(angle) -> int:
+    return int(round((angle or 0) / 90.0)) * 90 % 360
+
+
+def page_needs(entry: dict | None, sweep: bool) -> bool:
+    """Is there anything left to send for a page? A page not yet in the store needs everything."""
+    return entry is None or bool(entry.get("pending")) or (sweep and not entry.get("swept"))
+
+
+def plan_jobs(pno: int, page_rect, entry: dict, sweep: bool) -> list[Job]:
+    """The requests a page needs: its waiting blocks, grouped by the way they lie on the page, and (with
+    `sweep`, once per page) a look over the whole page for text the OCR missed."""
+    rect = tuple(page_rect)
+    jobs: list[Job] = []
+    by_angle: dict[int, list[dict]] = {}
+    for u in entry.get("pending", []):
+        by_angle.setdefault(_snap(u.get("angle")), []).append(u)
+    if sweep and not entry.get("swept"):
+        upright = by_angle.pop(0, [])
+        handled = [u["bbox"] for u in entry.get("units", [])] + [u["bbox"] for us in by_angle.values() for u in us]
+        pieces = _pieces(rect)
+        home = {id(u): _home(u, pieces) for u in upright}
+        for k, piece in enumerate(pieces):
+            mine = [u for u in upright if home[id(u)] == k]
+            others = [u["bbox"] for u in upright if home[id(u)] != k]
+            jobs.append(Job(pno, piece, 0, mine, [b for b in handled + others if inter(b, piece) > 0], True))
+    for angle, us in by_angle.items():
+        box = union([u["bbox"] for u in us])
+        # some of the page around the blocks, so the model sees what they belong to
+        pad = max(24.0, 0.12 * max(box[2] - box[0], box[3] - box[1]))
+        need_w, need_h = max(0.0, 260 - (box[2] - box[0])) / 2, max(0.0, 260 - (box[3] - box[1])) / 2
+        region = (max(rect[0], box[0] - pad - need_w), max(rect[1], box[1] - pad - need_h),
+                  min(rect[2], box[2] + pad + need_w), min(rect[3], box[3] + pad + need_h))
+        pieces = _pieces(region)
+        home = {id(u): _home(u, pieces) for u in us}
+        for k, piece in enumerate(pieces):
+            mine = [u for u in us if home[id(u)] == k]
+            if mine:
+                jobs.append(Job(pno, piece, angle, mine, [], False))
+    return jobs
+
+
+def render_region(page: pymupdf.Page, region, turn: int) -> Image.Image:
+    """The picture of a region for a request: sharp enough for the API's image size, and turned back so
+    that text lying at `turn` degrees reads upright."""
+    clip = pymupdf.Rect(*region)
+    dpi = max(100.0, min(300.0, IMAGE_LONG_EDGE * 72.0 / max(clip.width, clip.height, 1.0)))
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(dpi / 72, dpi / 72), clip=clip, colorspace=pymupdf.csRGB, alpha=False)
+    im = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    if turn:   # PIL turns anticlockwise, which undoes a clockwise turn of the text
+        im = im.transpose({90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180, 270: Image.Transpose.ROTATE_270}[turn])
+    return im
+
+
+def build_request(model: str, effort: str, glossary: str, image_b64: str, job: Job) -> dict:
     system = SYSTEM_PROMPT
     if glossary.strip():
         system += "\n\nReader's glossary and context:\n" + glossary.strip()
-    blocks = []
-    for u in units:
-        x0, y0, x1, y1 = u.bbox
-        box = [round(1000 * (x0 - page_rect.x0) / page_rect.width), round(1000 * (y0 - page_rect.y0) / page_rect.height),
-               round(1000 * (x1 - page_rect.x0) / page_rect.width), round(1000 * (y1 - page_rect.y0) / page_rect.height)]
-        blocks.append({"id": u.id, "box": box, "ocr": u.ja, **({"vertical": True} if u.vertical else {})})
+    blocks = [{"id": k, "box": box_to_image(u["bbox"], job.region, job.turn), "ocr": u["ja"],
+               **({"vertical": True} if u.get("vertical") else {})} for k, u in enumerate(job.units)]
+    text = "OCR blocks for this image:\n" + json.dumps(blocks, ensure_ascii=False)
+    if job.sweep:
+        known = [box_to_image(b, job.region, job.turn) for b in job.known]
+        text += ("\n\nAlso report missed text in \"found\". Regions already handled (report nothing that lies "
+                 "inside them):\n" + json.dumps(known))
+    else:
+        text += "\n\nThis request does not ask for missed text: return an empty \"found\" list."
     return {
         "model": model,
         "max_tokens": MAX_TOKENS,
@@ -328,9 +489,29 @@ def build_request(model: str, effort: str, glossary: str, image_b64: str, units:
         "output_config": {"effort": effort, "format": {"type": "json_schema", "schema": SCHEMA}},
         "messages": [{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
-            {"type": "text", "text": "OCR blocks for this page:\n" + json.dumps(blocks, ensure_ascii=False)},
+            {"type": "text", "text": text},
         ]}],
     }
+
+
+def read_response(resp, job: Job) -> dict:
+    """What a response says, as plain data: {"en": {block number: English}, "found": [units in page points]}."""
+    text = next(b.text for b in resp.content if b.type == "text")
+    data = json.loads(text)
+    en = {str(int(b["id"])): clean_text(str(b["en"])).strip() for b in data["blocks"]}
+    found = []
+    for f in data.get("found") or []:
+        box = [int(v) for v in f.get("box") or []]
+        english = clean_text(str(f.get("en") or "")).strip()
+        if len(box) != 4 or not english or not job.sweep:
+            continue
+        box = [max(0, min(1000, v)) for v in box]
+        if box[2] - box[0] < 3 or box[3] - box[1] < 3:
+            continue
+        found.append({"bbox": [round(v, 2) for v in box_from_image(box, job.region, job.turn)], "lines": [],
+                      "ja": clean_text(str(f.get("ja") or "")).strip(), "en": english, "vertical": bool(f.get("vertical")),
+                      "angle": (job.turn + int(f.get("angle") or 0)) % 360, "conf": 0.0, "loose": True, "src": "found"})
+    return {"en": en, "found": found}
 
 
 def input_token_bound(request: dict, image_tokens: int) -> int:
@@ -390,70 +571,89 @@ def _cache_dir(dst: Path) -> Path:
     return CACHE_DIR / key
 
 
-def _cache_get(dst: Path, page: int) -> dict | None:
+def _cache_get(dst: Path, key) -> dict | None:
+    """A cached result: `key` is a page number (a whole page, as this app stored them at first), or a name
+    such as a job's key or "p00012_read" (the blocks the OCR found on a page not yet in the file)."""
+    name = f"p{key:05d}" if isinstance(key, int) else key
     try:
-        return json.loads((_cache_dir(dst) / f"p{page:05d}.json").read_text(encoding="utf-8"))
+        return json.loads((_cache_dir(dst) / f"{name}.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
 
 
 def _cache_forget(dst: Path, page: int):
+    """Drop everything cached for a page (its positions changed, or it was read again)."""
     try:
-        (_cache_dir(dst) / f"p{page:05d}.json").unlink()
+        for f in _cache_dir(dst).glob(f"p{page:05d}*.json"):
+            f.unlink()
     except OSError:
         pass
 
 
-def _cache_put(dst: Path, page: int, entry: dict):
+def _cache_put(dst: Path, key, entry: dict):
+    name = f"p{key:05d}" if isinstance(key, int) else key
     d = _cache_dir(dst)
     d.mkdir(parents=True, exist_ok=True)
-    tmp = d / f"p{page:05d}.tmp"
+    tmp = d / f"{name}.tmp"
     tmp.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, d / f"p{page:05d}.json")
+    os.replace(tmp, d / f"{name}.json")
 
 
 # ---- writing the PDF --------------------------------------------------------------------------------
-def write_invisible_box(page: pymupdf.Page, rect_display: pymupdf.Rect, text: str):
-    """Invisible English text filling a box, at the largest size that fits (so search hits land on it)."""
+def write_invisible_box(page: pymupdf.Page, rect_display: pymupdf.Rect, text: str, angle: int = 0):
+    """Invisible English text filling a box, at the largest size that fits (so search hits land on it).
+    angle: 90, 180 or 270 when the block lies turned on the page; the text is then set turned with it."""
     r = pymupdf.Rect(rect_display) * page.derotation_matrix
     r.normalize()
+    angle %= 360
+    centre = pymupdf.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+    lay = r
+    if angle in (90, 270):     # set it in a box of the block's size before the turn, then turn that about the middle
+        lay = pymupdf.Rect(centre.x - r.height / 2, centre.y - r.width / 2, centre.x + r.height / 2, centre.y + r.width / 2)
+    morph = (centre, pymupdf.Matrix(-angle)) if angle else None
     font = _font_for(text) if any(ord(ch) > 0xFF for ch in text) else pymupdf.Font("helv")
-    size = min(11.0, max(3.0, r.height * 0.8))
+    size = min(11.0, max(3.0, lay.height * 0.8))
+    longest = max(text.split(), key=len, default="")
     while True:
         tw = pymupdf.TextWriter(page.rect)
         try:
-            overflow = tw.fill_textbox(r, text, font=font, fontsize=size, warn=None)
+            if font.text_length(longest, fontsize=size) > lay.width:
+                overflow = [text]      # a word would be broken in two, and search would no longer find it
+            else:
+                overflow = tw.fill_textbox(lay, text, font=font, fontsize=size, warn=None)
         except Exception:
             overflow = [text]
         if not overflow:
-            tw.write_text(page, render_mode=3)
+            tw.write_text(page, render_mode=3, morph=morph)
             return
         if size <= 2.5:
             break
         size *= 0.86
     # too much text for the box even at the smallest size: one stretched line still makes it searchable
-    write_invisible_line(page, r, " ".join(text.split()))
+    write_invisible_line(page, r, " ".join(text.split()), angle)
 
 
-def assemble(base: Path, out: Path, new_pages: dict[int, dict], meta: dict):
-    """Write `out` = `base` plus the text layers and stored translation of `new_pages` (page -> cache entry)."""
+def assemble(base: Path, out: Path, pages: dict[int, dict], meta: dict):
+    """Write `out` = `base` with the pages in `pages` brought up to date. Each value holds the page's new
+    stored "entry", the "new_units" whose invisible text has to be written, and for a bare scan the
+    "ocr_lines" of its Japanese layer."""
     with LOCK:
         doc = pymupdf.open(base)
         try:
-            store = load_translation(doc) or {"version": 1, "source_language": "ja", "target_language": "en", "pages": {}}
-            for pno, entry in sorted(new_pages.items()):
-                if str(pno) in store["pages"] or pno >= doc.page_count:
+            store = load_translation(doc) or {"version": 2, "source_language": "ja", "target_language": "en", "pages": {}}
+            for pno, upd in sorted(pages.items()):
+                if pno >= doc.page_count:
                     continue
                 page = doc[pno]
                 isolate_content(page)
-                if not page_has_text(page):   # a bare scan: give it the Japanese layer too
-                    for x0, y0, x1, y1, text in entry.get("ocr_lines", []):
+                if upd.get("ocr_lines") and not page_has_text(page):   # a bare scan: give it the Japanese layer too
+                    for x0, y0, x1, y1, text in upd["ocr_lines"]:
                         write_invisible_line(page, pymupdf.Rect(x0, y0, x1, y1), text)
-                units = [u for u in entry.get("units", []) if u.get("en", "").strip()]
-                for u in units:
-                    write_invisible_box(page, english_rect(u["bbox"], page.rect, u["en"]), u["en"])
-                store["pages"][str(pno)] = {"model": entry.get("model", ""), "units": units}
+                for u in upd.get("new_units", []):
+                    write_unit_layers(page, u, japanese=u.get("src") == "found")
+                store["pages"][str(pno)] = upd["entry"]
             store.update(meta)
+            store["version"] = 2
             save_translation(doc, store)
             md = dict(doc.metadata or {})
             kw = set((md.get("keywords") or "").split())
@@ -469,22 +669,44 @@ def assemble(base: Path, out: Path, new_pages: dict[int, dict], meta: dict):
 
 
 # ---- estimate ---------------------------------------------------------------------------------------
-def estimate_cost(doc: pymupdf.Document, pages: list[int], model: str, budget: Budget) -> tuple[float, float]:
+def pages_to_do(doc: pymupdf.Document, pages: list[int], sweep: bool) -> list[int]:
+    """The pages among `pages` that still have something to send."""
+    with LOCK:
+        store = (load_translation(doc) or {"pages": {}})["pages"]
+    return [p for p in pages if page_needs(store.get(str(p)), sweep)]
+
+
+def request_sizes(doc: pymupdf.Document, pages: list[int], sweep: bool) -> list[tuple[float, float]]:
+    """(width, height) in points of the region each request for `pages` would show."""
+    out = []
+    with LOCK:
+        store = (load_translation(doc) or {"pages": {}})["pages"]
+        for p in pages:
+            rect = doc[p].rect
+            entry = store.get(str(p))
+            if entry is None:            # not read yet: the whole page, in pieces when it is very large
+                regions = _pieces(tuple(rect)) if sweep else [tuple(rect)]
+            else:
+                regions = [j.region for j in plan_jobs(p, rect, entry, sweep)]
+            out += [(r[2] - r[0], r[3] - r[1]) for r in regions]
+    return out
+
+
+def estimate_cost(doc: pymupdf.Document, pages: list[int], model: str, budget: Budget, sweep: bool = True) -> tuple[float, float]:
     """A rough (low, high) cost for translating `pages`. From this app's own history when there is some,
-    otherwise from page size. The spending guard, not this estimate, is what limits spending."""
-    if not pages:
+    otherwise from the size of what is sent. The spending guard, not this estimate, is what limits spending."""
+    sizes = request_sizes(doc, pages, sweep)
+    if not sizes:
         return 0.0, 0.0
     avg = budget.average_cost(model)
     if avg is not None:
-        return len(pages) * avg * 0.7, len(pages) * avg * 1.4
+        return len(sizes) * avg * 0.7, len(sizes) * avg * 1.5
     p = price_row(model)
     total = 0.0
-    with LOCK:
-        sizes = [(doc[i].rect.width, doc[i].rect.height) for i in pages]
     for w, h in sizes:
         mp = (w * DEFAULT_DPI / 72) * (h * DEFAULT_DPI / 72) / 1e6     # megapixels at OCR density
-        dense = min(1.0, mp / 6.5)                                       # a full spread is ~6.5 MP
-        in_tok = min(IMAGE_MAX_TOKENS, mp * 1e6 / 784) + 900 + 2500 * dense
+        dense = min(1.0, mp / 6.5)
+        in_tok = min(IMAGE_MAX_TOKENS, mp * 1e6 / 784) + 1500 + 2500 * dense
         out_tok = 500 + 3000 * dense
         total += (in_tok * p["in"] + out_tok * p["out"]) / 1e6
     return total * 0.6, total * 1.7
@@ -504,8 +726,13 @@ def translate_pdf(
     replace: bool = True,
     progress: Callable[[int, int, str, float], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
+    sweep: bool = True,
 ) -> TranslateResult:
     """Translate `pages` (0-based; default all) of `src` into its working copy, "<name> (OCR).pdf".
+
+    Only what is missing is sent: the blocks of a page that have no translation yet (all of them, for a
+    page not seen before; after a page was read again, only the new ones), and, with `sweep`, one look
+    per page for text the OCR could not read (handwriting, slanted or sideways text).
 
     run_cap: spend at most this many dollars in this run, on top of the monthly limit.
     replace=False leaves the result in a temp file (`result.output`) for the caller to swap in, for when
@@ -521,29 +748,46 @@ def translate_pdf(
     with LOCK:
         doc = pymupdf.open(base)
         page_count = doc.page_count
-        done_in_file = {int(k) for k in (load_translation(doc) or {"pages": {}})["pages"]}
+        stored = (load_translation(doc) or {"pages": {}})["pages"]
     try:
         wanted = [p for p in (pages if pages is not None else range(page_count)) if 0 <= p < page_count]
-        res.already_done = sum(1 for p in wanted if p in done_in_file)
-        todo = [p for p in wanted if p not in done_in_file]
-        new_pages: dict[int, dict] = {}
-        to_send: list[int] = []
-        for p in todo:
-            entry = _cache_get(dst, p)
-            if entry and entry.get("status") in ("ok", "empty"):
-                new_pages[p] = entry
+        entries: dict[int, dict] = {}        # working copies of the pages this run touches
+        ocr_lines: dict[int, list] = {}      # Japanese layer for pages that are bare scans
+        new_units: dict[int, list] = {}      # units whose invisible text has to be written
+        dirty: set[int] = set()
+        to_read: list[int] = []
+        for p in wanted:
+            e = stored.get(str(p))
+            if e is not None:
+                if page_needs(e, sweep):
+                    entries[p] = copy.deepcopy(e)
+                else:
+                    res.already_done += 1
+                continue
+            whole = _cache_get(dst, p)       # a whole page, cached by an earlier version of this app
+            if whole and whole.get("status") in ("ok", "empty"):
+                units = [dict(u, src="ocr") for u in whole.get("units", []) if (u.get("en") or "").strip()]
+                entries[p] = {"model": whole.get("model", ""), "units": units, "pending": [], "swept": False}
+                ocr_lines[p], new_units[p] = whole.get("ocr_lines", []), list(units)
+                dirty.add(p)
                 res.from_cache += 1
+                continue
+            read = _cache_get(dst, f"p{p:05d}_read")     # read by the OCR in a run that did not finish
+            if read:
+                entries[p] = {"units": [], "pending": read["pending"], "swept": False}
+                ocr_lines[p] = read.get("ocr_lines", [])
             else:
-                to_send.append(p)
+                to_read.append(p)
 
         stop = threading.Event()
         lock = threading.Lock()
-        state = {"run_spent": 0.0, "run_pending": 0.0, "net_failures": 0, "done": 0}
-        total = len(to_send)
+        state = {"run_spent": 0.0, "run_pending": 0.0, "net_failures": 0, "done": 0, "total": 0}
+        paid_pages: set[int] = set()
+        failed_sweep: set[int] = set()
 
         def report(msg: str):
             if progress:
-                progress(state["done"], total, msg, res.cost)
+                progress(state["done"], state["total"], msg, res.cost)
 
         def halt(reason: str, message: str):
             with lock:
@@ -551,7 +795,31 @@ def translate_pdf(
                     res.stopped, res.message = reason, message
             stop.set()
 
-        def work(pno: int, units: list[Unit], request: dict, rid: str, worst: float, entry: dict):
+        def take(job: Job, result: dict):
+            """Put a request's answer into its page: translated blocks leave the waiting list."""
+            entry = entries[job.page]
+            answered = {id(u) for u in job.units}
+            fresh = []
+            for k, u in enumerate(job.units):
+                u["en"] = result["en"].get(str(k), "")
+                if u["en"].strip():
+                    fresh.append(u)
+            entry["pending"] = [u for u in entry.get("pending", []) if id(u) not in answered]
+            n_found = 0
+            for f in result.get("found", []):
+                everything = entry.get("units", []) + entry["pending"] + fresh
+                if any(cover(f["bbox"], q["bbox"]) > 0.5 or cover(q["bbox"], f["bbox"]) > 0.7 for q in everything):
+                    continue                 # inside something already handled: the same text seen twice
+                fresh.append(dict(f))
+                n_found += 1
+            entry.setdefault("units", []).extend(fresh)
+            new_units.setdefault(job.page, []).extend(fresh)
+            dirty.add(job.page)
+            res.blocks += len(fresh) - n_found
+            res.found += n_found
+
+        def work(job: Job, key: str, request: dict, rid: str, worst: float):
+            pno = job.page
             try:
                 resp = call_claude(client, request, stop)
             except Exception as e:
@@ -572,6 +840,7 @@ def translate_pdf(
                         halt(kind.split(":")[1], msg[:300])
                 with lock:
                     res.failed.append((pno, msg[:160]))
+                    failed_sweep.add(pno)
                     state["done"] += 1
                 report(f"Page {pno + 1}: failed")
                 return
@@ -584,112 +853,145 @@ def translate_pdf(
                 state["run_spent"] += cost
                 state["net_failures"] = 0
                 res.cost += cost
-            problem = ""
+            problem, result = "", None
             if resp.stop_reason == "refusal":
                 problem = "the model declined this page"
             elif resp.stop_reason == "max_tokens":
-                problem = "the page's translation did not fit in one response"
+                problem = "the translation did not fit in one response"
             else:
                 try:
-                    text = next(b.text for b in resp.content if b.type == "text")
-                    by_id = {int(b["id"]): str(b["en"]) for b in json.loads(text)["blocks"]}
-                    for u in units:
-                        u.en = clean_text(by_id.get(u.id, "")).strip()
+                    result = read_response(resp, job)
                 except Exception as e:
                     problem = f"unreadable response ({type(e).__name__})"
             with lock:
                 state["done"] += 1
                 if problem:
                     res.failed.append((pno, problem))
+                    failed_sweep.add(pno)
                 else:
-                    entry.update(status="ok", model=resp.model or request["model"], cost=cost,
-                                 units=[{"bbox": list(u.bbox), "ja": u.ja, "en": u.en, "vertical": u.vertical} for u in units])
-                    _cache_put(dst, pno, entry)
-                    new_pages[pno] = entry
-                    res.translated += 1
-            report(f"Page {pno + 1}: " + (problem or f"translated (${cost:.3f})"))
+                    _cache_put(dst, key, dict(result, status="ok", model=resp.model or request["model"], cost=cost))
+                    take(job, result)
+                    entries[pno]["model"] = resp.model or request["model"]
+                    paid_pages.add(pno)
+            report(f"Page {pno + 1}: " + (problem or f"{len(job.units)} block(s)"
+                                          + (f", {len(result['found'])} more found" if result["found"] else "")
+                                          + f" (${cost:.3f})"))
 
-        if to_send:
-            if budget.status().limit is None:
-                halt("no limit", "Set a monthly API limit first (Translate > Settings).")
-            else:
-                client = client or make_client()
-                if engine is None:
-                    from .ocr_engine import OcrEngine
-                    engine = OcrEngine()
-                report("Loading OCR models…")
-                engine.load()
-        with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-            for start in range(0, len(to_send), OCR_BATCH):
-                if stop.is_set():
-                    break
+        work_to_do = bool(to_read) or any(page_needs(e, sweep) for e in entries.values())
+        if work_to_do and budget.status().limit is None:
+            halt("no limit", "Set a monthly API limit first (Translate > Settings).")
+        elif work_to_do:
+            client = client or make_client()
+
+        # pages the file has not seen: read them with the OCR first (local, free)
+        if to_read and not stop.is_set():
+            if engine is None:
+                from .ocr_engine import OcrEngine
+                engine = OcrEngine()
+            report("Loading OCR models…")
+            engine.load()
+            for start in range(0, len(to_read), OCR_BATCH):
                 if cancelled and cancelled():
                     halt("cancelled", "Cancelled.")
                     break
-                batch = to_send[start:start + OCR_BATCH]
+                batch = to_read[start:start + OCR_BATCH]
+                report(f"Reading page {batch[0] + 1}" + (f" to {batch[-1] + 1}" if len(batch) > 1 else "") + "…")
                 with LOCK:
                     rendered = [render_page(doc[p], DEFAULT_DPI) for p in batch]
                     had_text = [page_has_text(doc[p]) for p in batch]
-                    rects = [(doc[p].rect, doc[p].derotation_matrix) for p in batch]
-                ocr_results = engine.ocr_images([im for im, _ in rendered])
-                futures = []
-                for pno, (im, mat), ocr, has_text, (prect, derot) in zip(batch, rendered, ocr_results, had_text, rects):
-                    if stop.is_set():
-                        break
-                    units = build_units(ocr, ~mat)
-                    entry = {"page": pno, "status": "empty", "units": [], "ocr_lines": []}
+                    derots = [doc[p].derotation_matrix for p in batch]
+                for pno, (im, mat), ocr, has_text, derot in zip(batch, rendered, engine.ocr_pages([im for im, _ in rendered]), had_text, derots):
+                    lines = []
                     if not has_text:   # unrotated page space, ready for write_invisible_line
                         for b in ocr.blocks:
                             for l in b.lines:
                                 if l.text and l.confidence >= (0.5 if b.label in ("Picture", "Figure") else 0.0):
                                     r = pymupdf.Rect(*l.bbox) * (~mat * derot)
                                     r.normalize()
-                                    entry["ocr_lines"].append([r.x0, r.y0, r.x1, r.y1, l.text])
-                    if not units:
-                        _cache_put(dst, pno, entry)
-                        new_pages[pno] = entry
-                        with lock:
-                            res.empty += 1
-                            state["done"] += 1
-                        report(f"Page {pno + 1}: no text")
-                        continue
-                    image_b64, image_tokens = image_for_api(im)
-                    request = build_request(model, effort, glossary, image_b64, units, prect)
-                    worst = worst_case_cost(model, input_token_bound(request, image_tokens), MAX_TOKENS)
+                                    lines.append([r.x0, r.y0, r.x1, r.y1, l.text])
+                    pending = [u.to_dict() for u in build_units(ocr, ~mat)]
+                    _cache_put(dst, f"p{pno:05d}_read", {"pending": pending, "ocr_lines": lines})
+                    entries[pno] = {"units": [], "pending": pending, "swept": False}
+                    ocr_lines[pno] = lines
+                    dirty.add(pno)
+                    if not pending:
+                        res.empty += 1
 
-                    def try_reserve():
-                        with lock:
-                            over = run_cap is not None and state["run_spent"] + state["run_pending"] + worst > run_cap + 1e-9
-                        if over:
-                            return None, ("run cap", f"Stopped at this run's spending cap of ${run_cap:.2f}.")
-                        try:
-                            return budget.reserve(worst, model, f"{dst.name} p{pno + 1}"), None
-                        except BudgetNotSet as e:
-                            return None, ("no limit", str(e))
-                        except BudgetExceeded as e:
-                            return None, ("budget", "Stopped: " + str(e))
-
-                    rid, why = try_reserve()
-                    if rid is None and why[0] in ("budget", "run cap") and futures:
-                        # pages in flight hold worst-case reservations; let them finish and settle to
-                        # their real cost, then see whether this page fits after all
-                        for f in futures:
-                            f.result()
-                        futures = []
-                        rid, why = try_reserve()
-                    if rid is None:
-                        halt(*why)
-                        break
+        # the requests
+        jobs: list[Job] = []
+        if not stop.is_set():
+            with LOCK:
+                rects = {p: doc[p].rect for p in entries}
+            for p in sorted(entries):
+                jobs += plan_jobs(p, rects[p], entries[p], sweep)
+        state["total"] = len(jobs)
+        swept_pages = {j.page for j in jobs if j.sweep}
+        with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+            futures = []
+            for job in jobs:
+                if stop.is_set():
+                    break
+                if cancelled and cancelled():
+                    halt("cancelled", "Cancelled.")
+                    break
+                key = job.key(model, effort, glossary)
+                cached = _cache_get(dst, key)
+                if cached and cached.get("status") == "ok":      # paid for in a run that did not finish
                     with lock:
-                        state["run_pending"] += worst
-                    futures.append(pool.submit(work, pno, units, request, rid, worst, entry))
-                for f in futures:
-                    f.result()
+                        take(job, cached)
+                        state["done"] += 1
+                    report(f"Page {job.page + 1}: from the cache")
+                    continue
+                with LOCK:
+                    im = render_region(doc[job.page], job.region, job.turn)
+                image_b64, image_tokens = image_for_api(im)
+                request = build_request(model, effort, glossary, image_b64, job)
+                worst = worst_case_cost(model, input_token_bound(request, image_tokens), MAX_TOKENS)
 
-        if new_pages:
+                def try_reserve():
+                    with lock:
+                        over = run_cap is not None and state["run_spent"] + state["run_pending"] + worst > run_cap + 1e-9
+                    if over:
+                        return None, ("run cap", f"Stopped at this run's spending cap of ${run_cap:.2f}.")
+                    try:
+                        return budget.reserve(worst, model, f"{dst.name} p{job.page + 1}"), None
+                    except BudgetNotSet as e:
+                        return None, ("no limit", str(e))
+                    except BudgetExceeded as e:
+                        return None, ("budget", "Stopped: " + str(e))
+
+                rid, why = try_reserve()
+                if rid is None and why[0] in ("budget", "run cap") and futures:
+                    # requests in flight hold worst-case reservations; let them finish and settle to
+                    # their real cost, then see whether this one fits after all
+                    for f in futures:
+                        f.result()
+                    futures = []
+                    rid, why = try_reserve()
+                if rid is None:
+                    halt(*why)
+                    break
+                with lock:
+                    state["run_pending"] += worst
+                futures.append(pool.submit(work, job, key, request, rid, worst))
+            for f in futures:
+                f.result()
+
+        # a page counts as looked over once every request of its missed-text pass has come back
+        ran = {j.page for j in jobs}
+        for p in swept_pages:
+            still = any(j.sweep and j.page == p and _cache_get(dst, j.key(model, effort, glossary)) is None for j in jobs)
+            if not still and p not in failed_sweep:
+                entries[p]["swept"] = True
+                dirty.add(p)
+        res.translated = len(paid_pages)
+
+        if dirty:
             report("Writing the PDF…")
             tmp = part_path_for(dst)
-            assemble(base, tmp, new_pages, {"model": model})
+            assemble(base, tmp, {p: {"entry": {k: entries[p].get(k) for k in ("model", "units", "pending", "swept")},
+                                     "new_units": new_units.get(p, []), "ocr_lines": ocr_lines.get(p)}
+                                 for p in dirty}, {"model": model})
             if replace:
                 with LOCK:
                     doc.close()
@@ -700,13 +1002,15 @@ def translate_pdf(
         elif dst.exists():
             res.output = dst
         if not res.message:
-            parts = [f"{res.translated} page(s) translated"]
+            parts = [f"{res.blocks} block(s) translated on {res.translated} page(s)"]
+            if res.found:
+                parts.append(f"{res.found} more found that the OCR had missed")
             if res.from_cache:
-                parts.append(f"{res.from_cache} from cache")
+                parts.append(f"{res.from_cache} page(s) from the cache")
             if res.empty:
-                parts.append(f"{res.empty} without text")
+                parts.append(f"{res.empty} page(s) where the OCR found no text")
             if res.failed:
-                parts.append(f"{len(res.failed)} failed")
+                parts.append(f"{len(res.failed)} request(s) failed")
             res.message = ", ".join(parts) + f". Cost ${res.cost:.2f}."
         return res
     finally:
@@ -749,6 +1053,8 @@ def main(argv=None):
     ap.add_argument("--glossary", default="", help="names and terms to use, as text or a path to a text file")
     ap.add_argument("--max-spend", type=float, help="spend at most this many dollars in this run")
     ap.add_argument("--yes", action="store_true", help="start without asking")
+    ap.add_argument("--no-sweep", action="store_true",
+                    help="translate only what the OCR read; do not ask for text it missed (handwriting, slanted text)")
     ap.add_argument("--set-limit", type=float, help="set the monthly API limit in dollars")
     ap.add_argument("--margin", type=float, help="dollars of the limit to keep unspent")
     ap.add_argument("--period-day", type=int, help="day of the month the allowance renews (1-28)")
@@ -768,7 +1074,7 @@ def main(argv=None):
     with LOCK, pymupdf.open(args.pdf) as d:
         count = d.page_count
         pages = _parse_pages(args.pages, count) if args.pages else list(range(count))
-        low, high = estimate_cost(d, pages, args.model, budget)
+        low, high = estimate_cost(d, pages, args.model, budget, not args.no_sweep)
     _print_status(budget)
     print(f"{args.pdf.name}: {len(pages)} page(s) with {args.model} at {args.effort} effort, roughly ${low:.2f} to ${high:.2f}"
           + (f", capped at ${args.max_spend:.2f} for this run" if args.max_spend is not None else ""))
@@ -776,6 +1082,7 @@ def main(argv=None):
         return
     t0 = time.time()
     res = translate_pdf(args.pdf, pages, args.model, args.effort, glossary, budget=budget, run_cap=args.max_spend,
+                        sweep=not args.no_sweep,
                         progress=lambda d, t, m, c: print(f"[{d}/{t}] ${c:.2f}  {m}"))
     print(res.message)
     for pno, why in res.failed:

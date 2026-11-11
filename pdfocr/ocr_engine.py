@@ -111,6 +111,24 @@ class OcrEngine:
         layout_results = self._layout(images) if self._layout else [None] * len(images)
         return [self._assemble(im, o, l) for im, o, l in zip(images, ocr_results, layout_results)]
 
+    def ocr_pages(self, images: list[Image.Image]) -> list[PageOcr]:
+        """OCR page images; a very large page is read a second time in overlapping tiles.
+
+        The text detector works on a reduced copy of the image, so on a page several times the usual
+        size (a fold-out, a row of cards scanned as one page) small text is lost. Each tile is read at
+        full size; lines it finds that the whole-page pass missed are added, and a line the whole-page
+        pass read badly gives way to a tile's clearly better reading of the same spot."""
+        pages = self.ocr_images(images)
+        for page, im in zip(pages, images):
+            tiles = tile_boxes(im.size)
+            if len(tiles) < 2:
+                continue
+            results = []
+            for k in range(0, len(tiles), 4):
+                results += self.ocr_images([im.crop(t) for t in tiles[k:k + 4]])
+            add_tile_lines(page, tiles, results)
+        return pages
+
     def _assemble(self, image: Image.Image, ocr, layout) -> PageOcr:
         w, h = image.size
         lines: list[Line] = []
@@ -177,3 +195,62 @@ def _reading_order(lines: list[Line]) -> list[Line]:
                 continue
         rows.append(([ln], y0, y1))
     return [ln for row, _, _ in rows for ln in sorted(row, key=lambda l: l.bbox[0])]
+
+
+# ---- large pages: reading in tiles ----------------------------------------------------------------------
+TILE = 2400        # tile side in pixels: about what the detector sees a normal page at
+BIG = 3200         # pages with a side longer than this are also read in tiles
+
+
+def _spans(length: int) -> list[tuple[int, int]]:
+    """Tile positions along one side: half-overlapping, so any line up to half a tile long lies whole
+    inside at least one tile."""
+    if length <= BIG:
+        return [(0, length)]
+    step = TILE // 2
+    starts = list(range(0, length - TILE, step)) + [length - TILE]
+    return [(s, s + TILE) for s in starts]
+
+
+def tile_boxes(size: tuple[int, int]) -> list[tuple[int, int, int, int]]:
+    w, h = size
+    if max(w, h) <= BIG:
+        return []
+    return [(x0, y0, x1, y1) for y0, y1 in _spans(h) for x0, x1 in _spans(w)]
+
+
+def _cover(a, b) -> float:
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    return ix * iy / max(1e-6, (a[2] - a[0]) * (a[3] - a[1]))
+
+
+def add_tile_lines(page: PageOcr, tiles: list, results: list[PageOcr], edge: int = 8):
+    """Merge the tiles' readings into the whole-page result (see OcrEngine.ocr_pages)."""
+    have = [(ln, b) for b in page.blocks for ln in b.lines]
+    for (tx0, ty0, tx1, ty1), res in zip(tiles, results):
+        for b in res.blocks:
+            fresh = []
+            for ln in b.lines:
+                x0, y0, x1, y1 = ln.bbox
+                # a line touching an inner edge of its tile is cut off there; another tile has it whole
+                if ((x0 < edge and tx0 > 0) or (y0 < edge and ty0 > 0)
+                        or (x1 > (tx1 - tx0) - edge and tx1 < page.width) or (y1 > (ty1 - ty0) - edge and ty1 < page.height)):
+                    continue
+                box = (x0 + tx0, y0 + ty0, x1 + tx0, y1 + ty0)
+                clash = [(o, ob) for o, ob in have if _cover(box, o.bbox) > 0.5 or _cover(o.bbox, box) > 0.5]
+                if clash and not all(o.confidence + 0.15 < ln.confidence for o, _ in clash):
+                    continue
+                for o, ob in clash:                    # a worse reading of the same spot gives way
+                    if o in ob.lines:
+                        ob.lines.remove(o)
+                    have = [(p, pb) for p, pb in have if p is not o]
+                moved = Line(ln.text, box, [], ln.confidence)
+                fresh.append(moved)
+            if fresh:
+                bx0, by0, bx1, by1 = b.bbox
+                nb = Block(b.label, (bx0 + tx0, by0 + ty0, bx1 + tx0, by1 + ty0), fresh)
+                page.blocks.append(nb)
+                have += [(ln, nb) for ln in fresh]
+    page.blocks = [b for b in page.blocks if b.lines]
+

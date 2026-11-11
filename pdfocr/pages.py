@@ -21,8 +21,9 @@ def rotate_pages(src: Path, pages: list[int], degrees: int, replace: bool = True
     """Turn `pages` (0-based) of the book by `degrees` clockwise (a multiple of 90).
 
     The turn is written into the page itself, not left as a viewing flag, so the page behaves like any
-    upright page afterwards: OCR, the text layers, search and the English overlay need no special cases.
-    The scan is not re-encoded. Text layers and stored translation boxes turn with the page.
+    upright page afterwards: OCR, the text layers and search need no special cases. The scan is not
+    re-encoded. Text layers turn with the page, and so does its translation: each translated block stays
+    on the spot of the page it belongs to and records that it now lies turned (see units.py).
 
     Returns (working copy, file written, pages turned). replace=False leaves the new version in its
     ".part.pdf" file for a caller that has the document open."""
@@ -45,7 +46,7 @@ def rotate_pages(src: Path, pages: list[int], degrees: int, replace: bool = True
                 display_map = was * page.rotation_matrix     # displayed before -> displayed now
                 page.remove_rotation()                       # write the turn into the page content
                 page.wrap_contents()                         # ... and keep it from reaching text added later
-                tr.turn_units(doc, dst, p, display_map)
+                tr.turn_units(doc, dst, p, display_map, degrees)
                 turned.append(p)
             if not turned:
                 return dst, base, []

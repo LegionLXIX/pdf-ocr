@@ -209,8 +209,9 @@ class TranslateWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, src: Path, pages: list[int] | None, model: str, effort: str, glossary: str,
-                 run_cap: float | None, budget=None):
+                 run_cap: float | None, budget=None, sweep: bool = True):
         super().__init__()
+        self.sweep = sweep
         self.src, self.pages, self.model, self.effort = Path(src), pages, model, effort
         self.glossary, self.run_cap, self.budget = glossary, run_cap, budget
         self._cancel = False
@@ -223,6 +224,7 @@ class TranslateWorker(QThread):
         try:
             res = translate_pdf(self.src, self.pages, self.model, self.effort, self.glossary,
                                 budget=self.budget, engine=shared_engine(), run_cap=self.run_cap, replace=False,
+                                sweep=self.sweep,
                                 progress=lambda d, t, m, c: self.progress.emit(d, t, m, c),
                                 cancelled=lambda: self._cancel)
             self.done.emit(res)
