@@ -266,6 +266,11 @@ class MainWindow(QMainWindow):
         self.a_ocr = QAction("Make searchable (OCR)", self)
         self.a_ocr.triggered.connect(self.ocr_current)
         tb.addAction(self.a_ocr)
+        self.a_translate = QAction("Translate", self)
+        self.a_translate.setToolTip("Translate this document to English with Claude: choose pages, see the cost "
+                                    "estimate, and send only what is not translated yet")
+        self.a_translate.triggered.connect(lambda: self.translate_current())
+        tb.addAction(self.a_translate)
         self.a_english = QAction("English", self, checkable=True)
         self.a_english.setShortcut("E")
         self.a_english.setToolTip("Show the English translation over the page (E). "
