@@ -1,6 +1,8 @@
 """Continuous-scroll PDF view with background page rendering and search highlights."""
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import QObject, QRectF, QRunnable, Qt, QThreadPool, Signal, QSize, QTimer
 from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPen, QPixmap, QPainter, QTextOption
 from PySide6.QtWidgets import (QApplication, QFileDialog, QGraphicsItem, QGraphicsPixmapItem, QGraphicsRectItem,
@@ -332,39 +334,31 @@ class PdfView(QGraphicsView):
             items.append(box)
 
     def _make_inplace_overlay(self, page: int, units: list[dict], items: list):
-        """English set where the Japanese was: same place, the original's colour, as near its size as fits,
-        lying the way the block lies on the page. Where the Japanese could be painted out of the page
-        picture (the render job did that) the English stands on the page itself; where it could not
-        (text over artwork, heavy lettering, handwriting) the English stands on a backing panel."""
+        """English set where the Japanese was: inside the bounds of the text it translates, in the original's
+        colour, as near its size as fits, lying the way the block lies on the page.
+
+        Where the Japanese could be painted out of the page picture (the render job did that) the English
+        stands on the page itself. Where it could not (text over artwork, heavy lettering) the printed
+        lines get a backing in the colour behind them and the English is set over that. Handwriting and
+        other text whose box only marks a region is not painted out or covered: its English is fitted
+        inside that region with a backing no larger than the English itself."""
         pr, z = self.page_rects[page], self.zoom
         seen = self._unit_colors.get(page) or {}
         floor = 4.5 * z
         wrap = QTextOption.WrapMode.WordWrap
-        geo = []
-        for u in units:
-            b = u["bbox"]
-            geo.append(QRectF(pr.x() + b[0] * z, pr.y() + b[1] * z, (b[2] - b[0]) * z, (b[3] - b[1]) * z))
-        # the size ordinary text on this page is printed at: labels over handwriting are set at that size
+        # the size ordinary text on this page is printed at: text over handwriting starts from that
         thick = sorted(line_thickness(u) for u in units if not self._label_mode(page, u))
         body = (thick[len(thick) // 2] * 0.82 if thick else 10.0) * z
-
-        def free_right(k: int) -> float:
-            """How far block k's line may run on to the right before it meets another block or the edge."""
-            r, limit = geo[k], pr.right() - 3 * z
-            for j, o in enumerate(geo):
-                if j != k and o.left() >= r.right() - 1 and o.top() < r.bottom() and o.bottom() > r.top():
-                    limit = min(limit, o.left() - 2 * z)
-            return max(r.width(), limit - r.left())
 
         laid = []
         for k, u in enumerate(units):
             en = u["en"].strip()
-            r = geo[k]
+            b = u["bbox"]
+            r = QRectF(pr.x() + b[0] * z, pr.y() + b[1] * z, (b[2] - b[0]) * z, (b[3] - b[1]) * z)
             x, y, w, h = r.x(), r.y(), r.width(), r.height()
             label = self._label_mode(page, u)
             info = seen.get(k) or {}
             angle = float(u.get("angle") or 0) % 360
-            quarter = int(round(angle / 90.0)) * 90 % 360
             box = QGraphicsRectItem(r)                    # carries the text and takes the clicks
             box.setPen(QPen(Qt.PenStyle.NoPen))
             box.setZValue(4)
@@ -377,7 +371,7 @@ class PdfView(QGraphicsView):
             text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
                                          | Qt.TextInteractionFlag.TextSelectableByKeyboard)
             font = QFont(self.font())
-            d = {"u": u, "k": k, "box": box, "text": text, "font": font, "en": en, "geom": (x, y, w, h),
+            d = {"u": u, "k": k, "box": box, "text": text, "font": font, "en": en, "geom": (x, y, w, h), "rect": r,
                  "label": label, "plate": label or bool(info.get("plate")), "info": info}
 
             def set_size(size: float, width: float):
@@ -386,40 +380,44 @@ class PdfView(QGraphicsView):
                 text.setTextWidth(width)
 
             if label:
-                # a label: ordinary reading size, as wide as it needs up to a comfortable measure
-                turn = angle if u.get("src") == "found" else float(quarter)
-                along = h if int(round(turn / 90.0)) % 2 else w
-                measure = max(90 * z, min(max(along, 150 * z), 330 * z))
-                size = max(8.5 * z, min(body, 14 * z))
-                set_size(size, -1)
-                if text.boundingRect().width() > measure:
-                    set_size(size, measure)
-                d.update(size=size, width=text.textWidth(), rot=turn, one_line=False, length=along)
+                # The box marks a region the writing lies in, not the writing itself. The English follows
+                # the slope of the writing, at the size ordinary text is printed at on this page, and
+                # smaller where the region is too small for that.
+                turn = angle if u.get("src") == "found" else float(english_turn(u))
+                rad = math.radians(turn)
+                c, s = abs(math.cos(rad)), abs(math.sin(rad))
+                along = min(w / c if c > 0.15 else 1e9, h / s if s > 0.15 else 1e9)
+                fill = math.sqrt(0.55 * w * h / (0.7 * max(1, len(en))))
+                d.update(size=max(floor, min(fill, body, 14 * z)), width=max(24.0, along * 0.96), rot=turn,
+                         one_line=False, least=floor)
                 laid.append(d)
                 continue
             # along the block as ordinary text, down a narrow vertical column, and turned with the page
             rot = english_turn(u)
             length, room = (h, w) if rot in (90, 270) else (w, h)
-            # a one-line original (a heading, a caption) stays on one line: English is often longer than
-            # its box, so it may run on into free space before it has to shrink
+            # a one-line original (a heading, a caption) stays on one line while that can be read
             one_line = "\n" not in (u.get("ja") or "") and "\n" not in en
-            reach = max(length, min(length * 2.2, free_right(k))) if (one_line and rot == 0) else length
 
             def fits(size: float) -> bool:
                 if one_line:
                     set_size(size, -1)
-                    return text.boundingRect().width() <= reach + 1
+                    return text.boundingRect().width() <= length + 1
                 set_size(size, max(10.0, length))
                 # whole words only: a word wider than the block means the type is still too large
                 return text.boundingRect().height() <= room + 1 and text.document().idealWidth() <= length + 1
 
             # start at the original's type size and shrink until the translation fits its block
             size = min(line_thickness(u) * z * 0.82, 48.0 * z)
+            start = size
             while not fits(size) and size > floor:
                 size = max(floor, size * 0.93)
-            if one_line and not fits(size):     # still too long at the smallest size: let it wrap after all
-                one_line = False
-            d.update(size=size, rot=float(rot), one_line=one_line, length=length, room=room, reach=reach)
+            if one_line and (size < start * 0.62 or not fits(size)):
+                # English much longer than a short caption: two lines inside the same bounds read better
+                # than one line of very small type
+                one_line, size = False, start
+                while not fits(size) and size > floor:
+                    size = max(floor, size * 0.93)
+            d.update(size=size, rot=float(rot), one_line=one_line, length=length, room=room, least=max(floor, size * 0.72))
             laid.append(d)
 
         # Text printed at one size should read at one size: blocks whose originals had about the same
@@ -444,14 +442,12 @@ class PdfView(QGraphicsView):
             text.setFont(font)
             if d["label"]:
                 text.setTextWidth(-1)
-                if text.boundingRect().width() > d["width"] > 0:
+                if text.boundingRect().width() > d["width"]:
                     text.setTextWidth(d["width"])
                 br = text.boundingRect()
                 text.setTransformOriginPoint(br.center())
                 text.setRotation(d["rot"])
-                big = w * h > 0.22 * pr.width() * pr.height()
-                cx, cy = (x + br.width() / 2 + 6 * z, y + br.height() / 2 + 6 * z) if big else (x + w / 2, y + h / 2)
-                text.setPos(cx - br.width() / 2, cy - br.height() / 2)
+                text.setPos(x + w / 2 - br.width() / 2, y + h / 2 - br.height() / 2)
                 return text.sceneBoundingRect()
             text.setTextWidth(-1 if d["one_line"] else max(10.0, d["length"]))
             br = text.boundingRect()
@@ -470,52 +466,50 @@ class PdfView(QGraphicsView):
                 text.setPos(x, y + slack)
             return text.sceneBoundingRect()
 
-        # Larger type first. A block that would run into one already placed gives way: a label steps
-        # down below it, other text shrinks, though not so far that it can no longer be read.
+        # Larger type first. Text over a region shrinks until it lies inside the region; a block that
+        # would run into one already placed shrinks too, though not so far that it can no longer be read.
         placed: list[QRectF] = []
         for d in sorted(laid, key=lambda d: (d["label"], -d["size"])):
             area = place(d)
-            hit = lambda a: next((p for p in placed if a.adjusted(1, 1, -1, -1).intersects(p)), None)
             if d["label"]:
-                for _ in range(8):
-                    p = hit(area)
-                    if p is None or p.bottom() + area.height() > pr.bottom():
-                        break
-                    d["text"].moveBy(0, p.bottom() + 3 * z - area.top())
-                    area = d["text"].sceneBoundingRect()
-            else:
-                least = max(floor, d["size"] * 0.72)
-                while d["size"] > least and hit(area) is not None:
-                    d["size"] = max(least, d["size"] * 0.93)
+                inside = d["rect"].adjusted(-1.5, -1.5, 1.5, 1.5)
+                while d["size"] > floor and not inside.contains(area):
+                    d["size"] = max(floor, d["size"] * 0.93)
                     area = place(d)
+                d["least"] = max(floor, d["size"] * 0.72)
+            while d["size"] > d["least"] and any(area.adjusted(1, 1, -1, -1).intersects(p) for p in placed):
+                d["size"] = max(d["least"], d["size"] * 0.93)
+                area = place(d)
             placed.append(area)
             d["area"] = area
 
         for d in laid:
-            box, text, info = d["box"], d["text"], d["info"]
+            box, text, info, u = d["box"], d["text"], d["info"], d["u"]
             color = QColor(*info["color"]) if info.get("color") else QColor(20, 20, 20)
             if d["plate"]:
-                # a panel behind the English, in the colour of what is behind the text where that is known
+                # a backing in the colour of what is behind the text, where that is known
                 bg = QColor(*info["bg"]) if info.get("bg") else QColor(255, 255, 255)
                 light = bg.lightnessF() >= 0.5
-                panel = QColor(bg).lighter(108) if light else QColor(bg).darker(115)
-                panel.setAlpha(236)
+                panel = QColor(bg).lighter(106) if light else QColor(bg).darker(112)
+                panel.setAlpha(232)
                 if abs(color.lightnessF() - panel.lightnessF()) < 0.42:
                     color = QColor(20, 20, 20) if light else QColor(245, 245, 245)
-                m = 2.5 * self.zoom
-                cover = d["area"].adjusted(-m, -m, m, m)
-                if not d["label"]:
-                    cover = cover.united(box.rect())      # hide the Japanese it replaces
-                if d["label"] and d["rot"] % 90:
-                    # a slanted label: the panel turns with the writing
-                    br = text.boundingRect().adjusted(-m, -m, m, m)
-                    plate = QGraphicsRectItem(br, text)
-                    plate.setFlag(QGraphicsItem.GraphicsItemFlag.ItemStacksBehindParent, True)
-                    plate.setPen(QPen(Qt.PenStyle.NoPen))
-                    plate.setBrush(QBrush(panel))
+                m = 1.5 * z
+                backs = []
+                if d["label"]:
+                    # no larger than the English itself, and turned with it
+                    backs.append(QGraphicsRectItem(text.boundingRect().adjusted(-m, -m, m, m), text))
                 else:
-                    box.setRect(cover)
-                    box.setBrush(QBrush(panel))
+                    # behind the printed lines only, so the Japanese is covered and nothing else is
+                    for l in (u.get("lines") or [u["bbox"]]):
+                        lr = QRectF(pr.x() + l[0] * z, pr.y() + l[1] * z, (l[2] - l[0]) * z, (l[3] - l[1]) * z)
+                        backs.append(QGraphicsRectItem(lr.adjusted(-m, -m, m, m), box))
+                for back in backs:
+                    back.setFlag(QGraphicsItem.GraphicsItemFlag.ItemStacksBehindParent, True)
+                    back.setPen(QPen(Qt.PenStyle.NoPen))
+                    back.setBrush(QBrush(panel))
+                    back.text_item = text          # a click on the backing reaches the text
+                box.backs = backs                  # keep the Python objects alive
             text.setDefaultTextColor(color)
             box.text_item = text   # keep the Python object alive; without this the child is collected
             self.scene().addItem(box)

@@ -124,11 +124,14 @@ painted out with the page's own background (a median fill around each block, `pd
 English is drawn where it was, in the original's colour and as near its size as fits; headings and labels
 stay on one line and paragraphs share a type size. Only the view changes; the PDF's page images are
 untouched, and switching English off shows the page as scanned. Painting out only works where the print
-can be told from what is behind it. Over a drawing, or for heavy display lettering, the block is left as
-it is and the English stands on a small backing panel instead; handwriting and text the translator
-located by eye (below) are shown the same way, as labels turned to the slope of the writing. English
-wraps at whole words, text printed at one size reads at one size, and a block that would run into its
-neighbour shrinks or steps aside. `Translate > Show the English in plain boxes` is the plainer
+can be told from what is behind it. Over a drawing, or for heavy display lettering, the printed lines get
+a backing in the colour behind them and the English is set over that. The English always stays inside the
+bounds of the text it translates: it shrinks, or wraps onto a second line, before it would run past its
+block, so nothing is laid over the artwork around the text. Handwriting, and text the translator located
+by eye (below), has only a rough region for a box; its English is set inside that region at the page's
+ordinary text size, turned to the slope of the writing, with a backing no larger than the English itself.
+English wraps at whole words, text printed at one size reads at one size, and a block that would run into
+its neighbour shrinks. `Translate > Show the English in plain boxes` is the plainer
 alternative. With English on you can drag inside a block to select and copy it; with it off, selection
 works on the Japanese.
 
