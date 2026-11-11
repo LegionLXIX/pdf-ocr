@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import sys
 from pathlib import Path
 
@@ -13,6 +14,9 @@ from PySide6.QtWidgets import (QApplication, QDialog, QDockWidget, QFileDialog, 
                                QRadioButton, QSpinBox, QToolBar, QToolButton, QVBoxLayout, QWidget, QStyle, QFrame,
                                QTextBrowser)
 
+from . import translate as tr
+from .budget import Budget
+from .dialogs import ImagesDialog, TranslateDialog, TranslateSettingsDialog
 from .library import Library, LibraryHit
 from .pdf_ocr import output_path_for, pages_needing_ocr
 from .pdflock import LOCK
@@ -89,6 +93,7 @@ class MainWindow(QMainWindow):
         self.resize(1500, 950)
         self.settings = QSettings("PDF OCR", "PDF OCR")
         self.library = Library()
+        self.budget = Budget()
         self.doc: pymupdf.Document | None = None
         self.doc_path = ""
         self.hits: list[tuple[int, pymupdf.Rect]] = []
@@ -241,6 +246,13 @@ class MainWindow(QMainWindow):
         self.a_ocr = QAction("Make searchable (OCR)", self)
         self.a_ocr.triggered.connect(self.ocr_current)
         tb.addAction(self.a_ocr)
+        self.a_english = QAction("English", self, checkable=True)
+        self.a_english.setShortcut("E")
+        self.a_english.setToolTip("Show the English translation over the page (E). "
+                                  "Available once the document has been translated.")
+        self.a_english.setEnabled(False)
+        self.a_english.toggled.connect(self._toggle_english)
+        tb.addAction(self.a_english)
         spacer = QWidget()
         spacer.setSizePolicy(spacer.sizePolicy().horizontalPolicy().Expanding, spacer.sizePolicy().verticalPolicy())
         tb.addWidget(spacer)
@@ -258,6 +270,8 @@ class MainWindow(QMainWindow):
         m_file.addAction("&Open…", QKeySequence.StandardKey.Open, self.open_dialog)
         self.m_recent = m_file.addMenu("Open &recent")
         self._refresh_recent_menu()
+        m_file.addSeparator()
+        m_file.addAction("New PDF from &images…", self.new_from_images)
         m_file.addSeparator()
         m_file.addAction("E&xit", QKeySequence.StandardKey.Quit, self.close)
 
@@ -279,6 +293,12 @@ class MainWindow(QMainWindow):
         m_lib.addAction("&Show library…", self.show_library)
         m_lib.addSeparator()
         m_lib.addAction("Re-&OCR this document (all pages)", lambda: self.ocr_current(force=True))
+
+        m_tr = self.menuBar().addMenu("&Translate")
+        m_tr.addAction("&Translate to English…", self.translate_current)
+        m_tr.addAction(self.a_english)
+        m_tr.addSeparator()
+        m_tr.addAction("API &key, limit and spending…", lambda: TranslateSettingsDialog(self, self.budget).exec())
 
         m_help = self.menuBar().addMenu("&Help")
         m_help.addAction("&About", lambda: QMessageBox.about(
@@ -306,9 +326,14 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, APP_NAME, f"Could not open PDF:\n{e}")
                 return
-            # Prefer the OCR'd sibling of a scan the user double-clicked
-            ocr_sibling = output_path_for(p)
-            if ocr_sibling.exists() and p != ocr_sibling and pages_needing_ocr(doc):
+            # Prefer the translated copy, else the OCR'd one, of a scan the user double-clicked
+            en_sibling, ocr_sibling = tr.output_path_for(p), output_path_for(p)
+            if en_sibling.exists() and p != en_sibling:
+                doc.close()
+                doc = pymupdf.open(en_sibling)
+                p = en_sibling
+                self.statusBar().showMessage(f"Opened the translated copy: {p.name}", 6000)
+            elif ocr_sibling.exists() and p != ocr_sibling and pages_needing_ocr(doc):
                 doc.close()
                 doc = pymupdf.open(ocr_sibling)
                 p = ocr_sibling
@@ -316,12 +341,21 @@ class MainWindow(QMainWindow):
             if self.doc:
                 self.doc.close()
             missing = pages_needing_ocr(doc)
+            stored = tr.load_translation(doc)
         self.doc, self.doc_path = doc, str(p)
         self.setWindowTitle(f"{p.name} — {APP_NAME}")
         self.settings.setValue("last_dir", str(p.parent))
         self._push_recent(str(p))
         self.view.set_document(doc, str(p))
         self.thumbs.set_document(doc, str(p))
+        pages = {int(k): v.get("units", []) for k, v in (stored or {}).get("pages", {}).items()}
+        self.view.set_translation(pages)
+        has_en = any(pages.values())
+        self.a_english.setEnabled(has_en)
+        self.a_english.blockSignals(True)
+        self.a_english.setChecked(has_en and self.settings.value("show_english", True, type=bool))
+        self.a_english.blockSignals(False)
+        self.view.set_show_english(self.a_english.isChecked())
         self.page_spin.setRange(1, doc.page_count)
         self.page_total.setText(f" / {doc.page_count} ")
         self.hits, self.current_hit = [], -1
@@ -448,6 +482,8 @@ class MainWindow(QMainWindow):
             else:
                 self.view.go_to_page(data.page)
             return
+        if not isinstance(data, int) or not 0 <= data < len(self.hits):
+            return   # a row from a search that has just been cleared
         self.current_hit = data
         page, rects = self.hits[data]
         self.view.set_current_hit(data)
@@ -569,6 +605,51 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(dlg)
         lay.addWidget(tb)
         dlg.exec()
+
+    # ---- images to PDF, translation -----------------------------------------------
+    def new_from_images(self):
+        dlg = ImagesDialog(self, self.settings.value("last_dir", str(Path.home())))
+        if dlg.exec() and dlg.result_path:
+            self.open_pdf(dlg.result_path)
+
+    def _toggle_english(self, on: bool):
+        self.settings.setValue("show_english", on)
+        self.view.set_show_english(on)
+
+    def translate_current(self):
+        if not self.doc:
+            QMessageBox.information(self, APP_NAME, "Open a document first.")
+            return
+        dlg = TranslateDialog(self, self.doc, self.doc_path, self.view.current_page(), self.budget)
+        dlg.exec()
+        res = dlg.result
+        if res is None or res.output is None:
+            return
+        page = self.view.current_page()
+        dst, out = Path(res.dst), Path(res.output)
+        if out != dst:
+            # swap the finished file in; it may be the document that is open, so let go of it first
+            if self.search_worker and self.search_worker.isRunning():
+                self.search_worker.cancel()
+                self.search_worker.wait()
+            try:
+                with LOCK:
+                    if Path(self.doc_path) == dst:
+                        self.view.set_document(None)
+                        self.thumbs.set_document(None, "")
+                        self.doc.close()
+                        self.doc = None
+                    os.replace(out, dst)
+            except OSError as e:
+                QMessageBox.warning(self, APP_NAME, f"The translation is saved as\n{out}\nbut could not replace\n{dst}\n\n{e}")
+                return
+        try:
+            self.library.index_pdf(dst)
+        except Exception:
+            pass
+        self.open_pdf(str(dst), page=page)
+        QMessageBox.information(self, APP_NAME, res.message + (
+            "\n\n" + "\n".join(f"Page {p + 1}: {why}" for p, why in res.failed[:12]) if res.failed else ""))
 
     def closeEvent(self, e):
         for w in (self.search_worker, self.ocr_worker, self.index_worker):

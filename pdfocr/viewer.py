@@ -2,13 +2,22 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QObject, QRectF, QRunnable, Qt, QThreadPool, Signal, QSize, QTimer
-from PySide6.QtGui import QBrush, QColor, QImage, QPen, QPixmap, QPainter
+from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPen, QPixmap, QPainter
 from PySide6.QtWidgets import (QApplication, QFileDialog, QGraphicsItem, QGraphicsPixmapItem, QGraphicsRectItem,
-                               QGraphicsScene, QGraphicsView, QListWidget, QListWidgetItem, QAbstractItemView, QMenu)
+                               QGraphicsScene, QGraphicsTextItem, QGraphicsView, QListWidget, QListWidgetItem,
+                               QAbstractItemView, QMenu)
 import pymupdf
 
 from .pdflock import LOCK
 from .textutil import clean_text
+from .translate import english_rect
+
+OVERLAY_FILL = QColor(255, 255, 255, 240)
+OVERLAY_PEN = QColor(70, 130, 200, 200)
+
+
+def _has_cjk(s: str) -> bool:
+    return any(ch >= "⺀" for ch in s)
 
 GAP = 12
 HIT_COLOR = QColor(255, 220, 0, 110)
@@ -87,6 +96,9 @@ class PdfView(QGraphicsView):
         self.doc_path = ""
         self.zoom = 1.0
         self.fit_mode: str | None = None   # 'width' / 'page' keep fitting as the window resizes
+        self.show_english = False                         # draw the stored translation over the page
+        self._translation: dict[int, list[dict]] = {}     # page -> translated units stored in the PDF
+        self._overlay_items: dict[int, list[QGraphicsRectItem]] = {}
         self.page_items: list[QGraphicsPixmapItem] = []
         self.page_rects: list[QRectF] = []   # scene rects of pages at current zoom
         self.rendered: dict[int, float] = {}  # page -> zoom it was last rendered at
@@ -110,6 +122,7 @@ class PdfView(QGraphicsView):
         self.rendered, self.pending = {}, set()
         self._words, self._selection, self._sel_items, self._anchor = {}, [], [], None
         self._area, self._area_item, self._area_anchor = None, None, None
+        self._translation, self._overlay_items = {}, {}
         self.doc, self.doc_path = doc, path
         if doc is None:
             return
@@ -119,6 +132,7 @@ class PdfView(QGraphicsView):
 
     def _layout_pages(self):
         scene = self.scene()
+        self._clear_overlays()
         for item in self.page_items:
             scene.removeItem(item)
         self.page_items, self.page_rects = [], []
@@ -157,11 +171,106 @@ class PdfView(QGraphicsView):
         if not self.doc:
             return
         dpr = self.devicePixelRatioF()
-        for i in self._visible_pages():
+        visible = self._visible_pages()
+        for i in visible:
             if self.rendered.get(i) == (self.zoom, dpr) or i in self.pending:
                 continue
             self.pending.add(i)
             self.pool.start(_RenderJob(self.doc_path, i, self.zoom, self.signals, dpr))
+        if self.show_english:
+            for i in visible:
+                if i not in self._overlay_items:
+                    self._make_overlay(i)
+
+    # ---- English translation overlay ----------------------------------------------
+    def set_translation(self, pages: dict[int, list[dict]] | None):
+        """pages: page number -> units ({"bbox": [x0, y0, x1, y1] in page points, "en": text}) stored in the PDF."""
+        self._clear_overlays()
+        self._translation = pages or {}
+        self._words = {}
+        self._render_timer.start()
+
+    def has_translation(self) -> bool:
+        return bool(self._translation)
+
+    def set_show_english(self, on: bool):
+        """Show the stored English over the page. Selection and copy then work on the English text."""
+        if on == self.show_english:
+            return
+        self.show_english = on
+        self.clear_selection()
+        self._words = {}
+        self._clear_overlays()
+        self._render_timer.start()
+
+    def _clear_overlays(self):
+        for items in self._overlay_items.values():
+            for it in items:
+                self.scene().removeItem(it)   # removes the text child with it
+        self._overlay_items = {}
+
+    def _make_overlay(self, page: int):
+        units = self._translation.get(page) or []
+        self._overlay_items[page] = items = []
+        if not units or page >= len(self.page_rects):
+            return
+        pr, z = self.page_rects[page], self.zoom
+        with LOCK:
+            page_rect = self.doc[page].rect
+        for u in units:
+            en = (u.get("en") or "").strip()
+            if not en:
+                continue
+            r = english_rect(u["bbox"], page_rect, en)
+            x, y, w, h = pr.x() + r.x0 * z, pr.y() + r.y0 * z, r.width * z, r.height * z
+            box = QGraphicsRectItem()
+            box.setBrush(QBrush(OVERLAY_FILL))
+            pen = QPen(OVERLAY_PEN, 1)
+            pen.setCosmetic(True)
+            box.setPen(pen)
+            box.setZValue(4)
+            text = QGraphicsTextItem(box)
+            text.setDefaultTextColor(QColor(15, 15, 15))
+            text.document().setDocumentMargin(1.5)
+            text.setPlainText(en)
+            text.setTextWidth(max(10.0, w - 2))
+            text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
+                                         | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+            # largest type that fits the box, down to a floor; past that the box grows instead
+            size, floor = min(12.5 * z, max(6.0 * z, h * 0.8)), 6.0 * z
+            font = QFont(self.font())
+            while True:
+                font.setPixelSize(max(1, int(round(size))))
+                text.setFont(font)
+                th = text.boundingRect().height()
+                if th <= h or size <= floor:
+                    break
+                size = max(floor, size * 0.92)
+            box.setRect(x, y, w, max(h, th))
+            text.setPos(x + 1, y)
+            box.text_item = text   # keep the Python object alive; without this the child is collected
+            self.scene().addItem(box)
+            items.append(box)
+
+    def _overlay_text_at(self, view_pos) -> QGraphicsTextItem | None:
+        it = self.itemAt(view_pos)
+        if isinstance(it, QGraphicsTextItem):
+            return it
+        return getattr(it, "text_item", None)
+
+    def _overlay_selection(self) -> str:
+        fi = self.scene().focusItem()
+        if isinstance(fi, QGraphicsTextItem) and fi.textCursor().hasSelection():
+            return fi.textCursor().selectedText().replace(" ", "\n").replace(" ", "\n")
+        return ""
+
+    def _drop_overlay_focus(self):
+        fi = self.scene().focusItem()
+        if isinstance(fi, QGraphicsTextItem):
+            c = fi.textCursor()
+            c.clearSelection()
+            fi.setTextCursor(c)
+            self.scene().setFocusItem(None)
 
     def _on_rendered(self, page_no: int, zoom: float, img: QImage):
         self.pending.discard(page_no)
@@ -451,10 +560,29 @@ class PdfView(QGraphicsView):
                 raw = self.doc[page].get_text("words") if self.doc else []
             # drop unmappable glyphs (dot leaders etc.) and words that were nothing but those
             words = []
+            # A translated page carries two text layers on top of each other. With the English shown,
+            # selection works on the English (drop Japanese words); otherwise drop the English layer's
+            # words: Latin words inside a translated block that occur in that block's translation.
+            units = self._translation.get(page) or []
+            en_boxes = []
+            if units and not self.show_english:
+                with LOCK:
+                    page_rect = self.doc[page].rect
+                for u in units:
+                    en = (u.get("en") or "").strip()
+                    if en:
+                        en_boxes.append((english_rect(u["bbox"], page_rect, en) + (-2, -2, 2, 2), set(en.split())))
             for w in raw:
                 t = clean_text(w[4])
-                if t:
-                    words.append((w[0], w[1], w[2], w[3], t, w[5], w[6], w[7]))
+                if not t:
+                    continue
+                if units and self.show_english and _has_cjk(t):
+                    continue
+                if en_boxes and not _has_cjk(t):
+                    cx, cy = (w[0] + w[2]) / 2, (w[1] + w[3]) / 2
+                    if any(r.x0 <= cx <= r.x1 and r.y0 <= cy <= r.y1 and t in toks for r, toks in en_boxes):
+                        continue
+                words.append((w[0], w[1], w[2], w[3], t, w[5], w[6], w[7]))
             # reading order: block, line, word
             self._words[page] = sorted(words, key=lambda w: (w[5], w[6], w[7]))
         return self._words[page]
@@ -501,6 +629,12 @@ class PdfView(QGraphicsView):
             e.accept()
             return
         if e.button() == Qt.MouseButton.LeftButton and self.doc:
+            if self.tool == "text" and self.show_english and self._overlay_text_at(e.position().toPoint()):
+                # inside an English box: let the box's own text handle the drag-selection
+                self.clear_selection()
+                QGraphicsView.mousePressEvent(self, e)
+                return
+            self._drop_overlay_focus()
             if self.tool == "text":
                 self.clear_selection()
                 self._anchor = self._hit_test(e.position().toPoint())
@@ -676,6 +810,12 @@ class PdfView(QGraphicsView):
 
     def copy_selection(self) -> int:
         """Ctrl+C: text selection if there is one, else the snapshot box as an image."""
+        overlay = self._overlay_selection()
+        if overlay:
+            QApplication.clipboard().setText(overlay)
+            n = len(overlay.split())
+            self.copied.emit(n)
+            return n
         text = self.selected_text()
         if not text:
             if self.has_area():

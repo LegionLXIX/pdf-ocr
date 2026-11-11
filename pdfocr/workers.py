@@ -168,3 +168,59 @@ class IndexWorker(QThread):
                 continue
         self.progress.emit(len(pdfs), len(pdfs), "")
         self.done.emit(need)
+
+
+class ImagesToPdfWorker(QThread):
+    """Build a PDF from an ordered list of images."""
+    progress = Signal(int, int, str)
+    done = Signal(str, int, list)    # output path, pages written, skipped file names
+    failed = Signal(str)
+
+    def __init__(self, images: list[Path], dst: Path, split: bool, rtl: bool, overwrite: bool):
+        super().__init__()
+        self.images, self.dst, self.split, self.rtl, self.overwrite = images, Path(dst), split, rtl, overwrite
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        from .images_to_pdf import images_to_pdf
+        try:
+            out, n, skipped = images_to_pdf(self.images, self.dst, self.split, self.rtl, overwrite=self.overwrite,
+                                            progress=lambda d, t, m: self.progress.emit(d, t, m),
+                                            cancelled=lambda: self._cancel)
+            self.done.emit(str(out), n, skipped)
+        except InterruptedError:
+            self.failed.emit("Cancelled.")
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+class TranslateWorker(QThread):
+    """Translate pages of a PDF with Claude. The result is left in a temp file for the window to swap in,
+    because the destination may be the document that is open."""
+    progress = Signal(int, int, str, float)   # pages done, pages to send, message, cost so far (USD)
+    done = Signal(object)                      # translate.TranslateResult
+    failed = Signal(str)
+
+    def __init__(self, src: Path, pages: list[int] | None, model: str, effort: str, glossary: str,
+                 run_cap: float | None, budget=None):
+        super().__init__()
+        self.src, self.pages, self.model, self.effort = Path(src), pages, model, effort
+        self.glossary, self.run_cap, self.budget = glossary, run_cap, budget
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        from .translate import translate_pdf
+        try:
+            res = translate_pdf(self.src, self.pages, self.model, self.effort, self.glossary,
+                                budget=self.budget, engine=shared_engine(), run_cap=self.run_cap, replace=False,
+                                progress=lambda d, t, m, c: self.progress.emit(d, t, m, c),
+                                cancelled=lambda: self._cancel)
+            self.done.emit(res)
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")

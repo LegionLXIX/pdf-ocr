@@ -23,6 +23,7 @@ DEFAULT_DPI = 200
 BATCH = 4  # pages per OCR call; the 4090 has room for more but this keeps progress responsive
 MIN_TEXT_CHARS = 30  # pages with at least this much real text are left alone
 OCR_MARKER = "PDFOCR-done"  # stamped into the PDF keywords once a file has been OCR'd
+VERTICAL_ROTATION = -90     # degrees for vertical text; sign checked by the vertical-text test (chars must run downward)
 
 
 def output_path_for(src: Path) -> Path:
@@ -55,32 +56,67 @@ def write_text_layer(page: pymupdf.Page, ocr: PageOcr, mat: pymupdf.Matrix) -> i
     """Insert OCR words as invisible text positioned over the scan. Returns word count."""
     # pixel -> page (rotated display) -> unrotated page space, which insert_text uses
     inv = ~mat * page.derotation_matrix
-    font = pymupdf.Font("helv")
     n = 0
     for block in ocr.blocks:
-        if block.label in SKIP_LABELS:
-            continue
+        # text found inside pictures (callouts on diagrams) is kept unless the OCR was unsure of it
+        min_conf = 0.5 if block.label in SKIP_LABELS else 0.0
         for line in block.lines:
+            if not line.text or line.confidence < min_conf:
+                continue
             lr = pymupdf.Rect(*line.bbox) * inv
             lr.normalize()
-            if lr.is_empty or lr.height < 1:
-                continue
-            if not line.text:
-                continue
-            # Surya 0.17 gives no usable per-word boxes, so each line is written as one string
-            # stretched to the line's width; words then land roughly where they are on the scan.
-            fontsize = lr.height * 0.85
-            natural = font.text_length(line.text, fontsize=fontsize)
-            if natural <= 0:
-                continue
-            scale = max(0.3, min(3.0, lr.width / natural))
-            origin = pymupdf.Point(lr.x0, lr.y1 - lr.height * 0.22)
-            tw = pymupdf.TextWriter(page.rect)
-            tw.append(origin, line.text, font=font, fontsize=fontsize)
-            morph = (origin, pymupdf.Matrix(scale, 1)) if abs(scale - 1) > 0.02 else None
-            tw.write_text(page, render_mode=3, morph=morph)  # 3 = invisible
-            n += len(line.text.split())
+            if write_invisible_line(page, lr, line.text):
+                n += len(line.text.split())
     return n
+
+
+_FONTS: dict[str, pymupdf.Font] = {}
+
+
+def _font_for(text: str) -> pymupdf.Font:
+    """Helvetica for Latin text; MuPDF's built-in CJK font once a line has kana, kanji or full-width forms."""
+    name = "japan" if any(ch >= "⺀" for ch in text) else "helv"
+    if name not in _FONTS:
+        _FONTS[name] = pymupdf.Font(name)
+    return _FONTS[name]
+
+
+def is_vertical(rect: pymupdf.Rect, text: str) -> bool:
+    """A tall, narrow line of two or more characters: vertical Japanese text."""
+    return len(text) >= 2 and rect.height > 1.5 * rect.width
+
+
+def write_invisible_line(page: pymupdf.Page, lr: pymupdf.Rect, text: str) -> bool:
+    """Write one line of invisible text stretched over `lr` (unrotated page space).
+
+    Surya 0.17 gives no usable per-word boxes, so a line is one string stretched to the line's length;
+    words then land roughly where they are on the scan. Vertical lines are written top to bottom.
+    """
+    if lr.is_empty or lr.height < 1 or lr.width < 1:
+        return False
+    font = _font_for(text)
+    tw = pymupdf.TextWriter(page.rect)
+    if is_vertical(lr, text):
+        fontsize = lr.width * 0.85
+        natural = font.text_length(text, fontsize=fontsize)
+        if natural <= 0:
+            return False
+        scale = max(0.3, min(3.0, lr.height / natural))
+        # rotate a quarter turn clockwise about the top of the column: the text then runs downward
+        origin = pymupdf.Point(lr.x0 + lr.width * 0.22, lr.y0)
+        tw.append(origin, text, font=font, fontsize=fontsize)
+        tw.write_text(page, render_mode=3, morph=(origin, pymupdf.Matrix(scale, 1) * pymupdf.Matrix(VERTICAL_ROTATION)))
+        return True
+    fontsize = lr.height * 0.85
+    natural = font.text_length(text, fontsize=fontsize)
+    if natural <= 0:
+        return False
+    scale = max(0.3, min(3.0, lr.width / natural))
+    origin = pymupdf.Point(lr.x0, lr.y1 - lr.height * 0.22)
+    tw.append(origin, text, font=font, fontsize=fontsize)
+    morph = (origin, pymupdf.Matrix(scale, 1)) if abs(scale - 1) > 0.02 else None
+    tw.write_text(page, render_mode=3, morph=morph)  # 3 = invisible
+    return True
 
 
 def ocr_pdf(

@@ -6,3 +6,5 @@ transformers==4.56.2
 pymupdf>=1.26
 PySide6>=6.8
 pillow
+anthropic>=2.0
+keyring

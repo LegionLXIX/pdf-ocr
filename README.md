@@ -10,6 +10,10 @@ RPG and wargame rulebooks: pages where Tesseract misses the stippled headings an
   model, and writes an invisible text layer into a copy (`<name> (OCR).pdf`). The original is never touched.
 - Search within a document with highlighted hits, or across every book in the library (SQLite FTS5).
 - Select and copy text, or drag a box to copy any region of a page as a 300 dpi image.
+- **New PDF from images**: turn a folder of page scans into a PDF, losslessly.
+- **Japanese**: OCR reads Japanese, horizontal and vertical, into a searchable layer.
+- **Translate to English** (optional, uses the Claude API): an English text layer over the Japanese,
+  searchable and shown as an overlay, with a hard spending limit.
 
 ## Setup (fresh machine)
 
@@ -78,6 +82,65 @@ a new `ICON_NAME` in `make_icon.py` and run `register.py` again, or the old icon
 - **Library** (`%LOCALAPPDATA%\PDF OCR\library.db`): every text PDF you open and every OCR output is indexed
   (SQLite FTS5). `Library > Add folder…` indexes a whole folder tree and offers to OCR the scans in it.
   When both `X.pdf` and `X (OCR).pdf` exist, only the OCR'd one is used.
+- **New PDF from images** (`File` menu): add a folder or files, drag the rows into page order (or sort by
+  name or date), optionally split two-page spreads (right-hand page first for Japanese books), and save.
+  JPEG and PNG pages are embedded byte for byte, so nothing is re-compressed; WebP, BMP, TIFF and still
+  GIFs are converted losslessly; animated GIFs are skipped. Command line:
+  `.venv\Scripts\python.exe -m pdfocr.images_to_pdf "<folder>" [-o out.pdf] [--sort name|mtime] [--split] [--each-subfolder]`
+- **Japanese OCR**: nothing to switch on. Surya reads Japanese as it reads English; lines with kana or
+  kanji are written with a CJK font and vertical lines run top to bottom, so Japanese search lands on
+  the right spot. Text found inside pictures (callouts on diagrams) is kept when the OCR is confident.
+
+## Translating to English
+
+`Translate > Translate to English…` adds an English layer to a Japanese PDF and saves it as
+`<name> (EN).pdf` beside the source (the source is never modified).
+
+How it works, per page: Surya finds the text blocks and reads the Japanese locally; the page image and
+those blocks go to Claude, which reads the image to correct OCR mistakes and returns an English
+translation for each block; the English is written as invisible text over the block it translates and
+stored inside the PDF. So English searches (in the document and across the library) land on the right
+place, and the **English** toolbar button (E) shows the translation in boxes over the page. While the
+overlay is on you can drag inside a box to select and copy its English; with it off, selection works on
+the Japanese. A glossary box lets you name the book and fix how names and terms are spelled; it is sent
+with every page so the translation stays consistent.
+
+**What it needs.** A Claude API key from <https://platform.claude.com/settings/keys>, pasted once into
+`Translate > API key, limit and spending…`. It is stored in the Windows Credential Manager, never in a
+file. API use is billed by Anthropic separately from chat; some plans include monthly API credits.
+
+**The spending limit.** Nothing is sent until you enter a monthly limit. The API has no call that reports
+a credit balance to an ordinary key, so the app keeps its own ledger (`%LOCALAPPDATA%\PDF OCR\spend.json`)
+and applies one rule before every request:
+
+    spent this period + worst case of requests in flight + worst case of this request
+        <= monthly limit - safety margin
+
+Worst case is the request's input (bounded locally: an image's 28-pixel patches plus one token per byte
+of text) at the input price plus the full `max_tokens` at the output price, so a response cannot cost
+more than was reserved. After each response the real cost, from the response's own token counts,
+replaces the reservation. A request whose connection drops stays booked at worst case until you clear it
+in the settings dialog. A run can also be given its own smaller cap. Prices are in `pdfocr/budget.py`
+(checked against Anthropic's pricing page on 2026-11-10) and can be overridden in
+`%LOCALAPPDATA%\PDF OCR\prices.json`.
+
+The ledger only knows about spending made through this app. For an independent stop, leave auto-reload
+off in the Console's Billing page: Anthropic then refuses requests once the credits are gone, and the app
+stops cleanly when it sees that.
+
+**Never paying twice.** Each finished page is cached on disk as soon as it comes back and recorded
+inside the output PDF. Stopping, hitting the limit or a crash loses nothing; running again sends only
+the pages that are still missing. You can translate a few pages first to see the quality and the real
+cost per page (the estimate in the dialog uses your own history once there is some).
+
+Models: Claude Opus 5.5 by default, with Sonnet 5.5 (half the price) and Haiku 5.5 (cheapest) in the
+dialog. Command line:
+
+```
+.venv\Scripts\python.exe -m pdfocr.translate --set-limit 100 --margin 5
+.venv\Scripts\python.exe -m pdfocr.translate "book.pdf" --pages 1-5 --max-spend 2
+.venv\Scripts\python.exe -m pdfocr.translate --status
+```
 
 ## Speed and quality
 

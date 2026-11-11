@@ -90,10 +90,20 @@ class Library:
 
     @staticmethod
     def find_pdfs(folder: Path) -> list[Path]:
-        """All PDFs under a folder. When both X.pdf and X (OCR).pdf exist, only the OCR'd copy counts."""
-        all_pdfs = sorted(p for p in Path(folder).rglob("*.pdf") if p.is_file())
+        """All PDFs under a folder. When X.pdf has an OCR'd or translated copy beside it, only the most
+        complete one counts: X (EN).pdf, else X (OCR).pdf."""
+        from .translate import output_path_for as en_path_for
+        all_pdfs = sorted(p for p in Path(folder).rglob("*.pdf") if p.is_file() and not p.name.endswith(".part.pdf"))
         have = {str(p).lower() for p in all_pdfs}
-        return [p for p in all_pdfs if str(output_path_for(p)).lower() not in have]
+        keep = []
+        for p in all_pdfs:
+            en = en_path_for(p)
+            if en != p and str(en).lower() in have:
+                continue
+            if not p.stem.endswith((" (EN)", " (OCR)")) and str(output_path_for(p)).lower() in have:
+                continue
+            keep.append(p)
+        return keep
 
     # ---- search -------------------------------------------------------------------
     def search(self, query: str, limit: int = 500) -> list[LibraryHit]:
