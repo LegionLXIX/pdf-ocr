@@ -37,11 +37,11 @@ from PIL import Image
 
 from .budget import APP_DIR, Budget, BudgetExceeded, BudgetNotSet, cost_of_usage, price_row, worst_case_cost
 from .pdf_ocr import (DEFAULT_DPI, OCR_MARKER, _font_for, isolate_content, page_has_text, part_path_for,
-                      render_page, write_invisible_line)
+                      render_page, text_kinds, write_invisible_line)
 from .pdf_ocr import output_path_for as working_copy_for
 from .pdflock import LOCK
 from .textutil import clean_text
-from .units import build_units, cover, english_turn, inter, merge_reading, turn_unit, union
+from .units import build_units, cover, english_turn, inter, is_region, merge_reading, same_text, turn_unit, union
 
 DEFAULT_MODEL = "claude-opus-5-5"
 DEFAULT_EFFORT = "low"        # translation needs little deliberation; raise it in the dialog for hard pages
@@ -457,11 +457,12 @@ def plan_jobs(pno: int, page_rect, entry: dict, sweep: bool) -> list[Job]:
     return jobs
 
 
-def render_region(page: pymupdf.Page, region, turn: int) -> Image.Image:
+def render_region(page: pymupdf.Page, region, turn: int, dpi: float | None = None) -> Image.Image:
     """The picture of a region for a request: sharp enough for the API's image size, and turned back so
     that text lying at `turn` degrees reads upright."""
     clip = pymupdf.Rect(*region)
-    dpi = max(100.0, min(300.0, IMAGE_LONG_EDGE * 72.0 / max(clip.width, clip.height, 1.0)))
+    if dpi is None:
+        dpi = max(100.0, min(300.0, IMAGE_LONG_EDGE * 72.0 / max(clip.width, clip.height, 1.0)))
     pix = page.get_pixmap(matrix=pymupdf.Matrix(dpi / 72, dpi / 72), clip=clip, colorspace=pymupdf.csRGB, alpha=False)
     im = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
     if turn:   # PIL turns anticlockwise, which undoes a clockwise turn of the text
@@ -469,7 +470,7 @@ def render_region(page: pymupdf.Page, region, turn: int) -> Image.Image:
     return im
 
 
-def build_request(model: str, effort: str, glossary: str, image_b64: str, job: Job) -> dict:
+def build_request(model: str, effort: str, glossary: str, image_b64: str, job: Job, note: str = "") -> dict:
     system = SYSTEM_PROMPT
     if glossary.strip():
         system += "\n\nReader's glossary and context:\n" + glossary.strip()
@@ -482,6 +483,8 @@ def build_request(model: str, effort: str, glossary: str, image_b64: str, job: J
                  "inside them):\n" + json.dumps(known))
     else:
         text += "\n\nThis request does not ask for missed text: return an empty \"found\" list."
+    if note:
+        text += "\n\n" + note
     return {
         "model": model,
         "max_tokens": MAX_TOKENS,
@@ -633,10 +636,50 @@ def write_invisible_box(page: pymupdf.Page, rect_display: pymupdf.Rect, text: st
     write_invisible_line(page, r, " ".join(text.split()), angle)
 
 
+def layer_boxes(u: dict, page_rect) -> list[tuple]:
+    """The parts of a page a block's invisible text lies on: its own box and, for English set upright,
+    the box the English is set in, which can be the larger of the two."""
+    boxes = [tuple(u["bbox"])]
+    en = (u.get("en") or "").strip()
+    if en and english_turn(u) == 0:
+        boxes.append(tuple(english_rect(u["bbox"], pymupdf.Rect(*page_rect), en)))
+    return boxes
+
+
+def refresh_layers(page: pymupdf.Page, rects: list, units: list[dict]) -> int:
+    """Take the invisible text off parts of a page (`rects`, in page points as displayed) and write it
+    again from `units`, the blocks the page has now. A block that reaches into a cleared part is cleared
+    and written whole, so no block is left with half its text. Returns how many blocks were written."""
+    zone = [tuple(r) for r in rects]
+    again, rest = [], list(units)
+    grew = True
+    while grew:
+        grew = False
+        for k in range(len(rest) - 1, -1, -1):
+            mine = layer_boxes(rest[k], page.rect)
+            if any(inter(b, z) > 0 for b in mine for z in zone):
+                again.append(rest.pop(k))
+                zone += mine
+                grew = True
+    derot = page.derotation_matrix
+    for z in zone:
+        r = pymupdf.Rect(*z) * derot
+        r.normalize()
+        if not r.is_empty:
+            page.add_redact_annot(r)
+    page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                          text=pymupdf.PDF_REDACT_TEXT_REMOVE_INVISIBLE)
+    isolate_content(page)
+    for u in again:
+        write_unit_layers(page, u)
+    return len(again)
+
+
 def assemble(base: Path, out: Path, pages: dict[int, dict], meta: dict):
     """Write `out` = `base` with the pages in `pages` brought up to date. Each value holds the page's new
     stored "entry", the "new_units" whose invisible text has to be written, and for a bare scan the
-    "ocr_lines" of its Japanese layer."""
+    "ocr_lines" of its Japanese layer. A value with a "zone" (boxes of the page that were read again) has
+    the text layers of those parts written anew from its entry."""
     with LOCK:
         doc = pymupdf.open(base)
         try:
@@ -651,6 +694,8 @@ def assemble(base: Path, out: Path, pages: dict[int, dict], meta: dict):
                         write_invisible_line(page, pymupdf.Rect(x0, y0, x1, y1), text)
                 for u in upd.get("new_units", []):
                     write_unit_layers(page, u, japanese=u.get("src") == "found")
+                if upd.get("zone"):
+                    refresh_layers(page, upd["zone"], upd["entry"].get("units", []) + upd["entry"].get("pending", []))
                 store["pages"][str(pno)] = upd["entry"]
             store.update(meta)
             store["version"] = 2
@@ -713,6 +758,20 @@ def estimate_cost(doc: pymupdf.Document, pages: list[int], model: str, budget: B
 
 
 # ---- the job ----------------------------------------------------------------------------------------
+def _reading_of(ocr, mat: pymupdf.Matrix, has_text: bool, derot: pymupdf.Matrix) -> tuple[list[dict], list]:
+    """What an OCR pass over a whole page gives a page the file has not seen: its blocks, waiting to be
+    translated, and (for a bare scan) the lines of its Japanese text layer, in unrotated page space."""
+    lines = []
+    if not has_text:
+        for b in ocr.blocks:
+            for l in b.lines:
+                if l.text and l.confidence >= (0.5 if b.label in ("Picture", "Figure") else 0.0):
+                    r = pymupdf.Rect(*l.bbox) * (~mat * derot)
+                    r.normalize()
+                    lines.append([r.x0, r.y0, r.x1, r.y1, l.text])
+    return [u.to_dict() for u in build_units(ocr, ~mat)], lines
+
+
 def translate_pdf(
     src: Path,
     pages: list[int] | None = None,
@@ -901,15 +960,7 @@ def translate_pdf(
                     had_text = [page_has_text(doc[p]) for p in batch]
                     derots = [doc[p].derotation_matrix for p in batch]
                 for pno, (im, mat), ocr, has_text, derot in zip(batch, rendered, engine.ocr_pages([im for im, _ in rendered]), had_text, derots):
-                    lines = []
-                    if not has_text:   # unrotated page space, ready for write_invisible_line
-                        for b in ocr.blocks:
-                            for l in b.lines:
-                                if l.text and l.confidence >= (0.5 if b.label in ("Picture", "Figure") else 0.0):
-                                    r = pymupdf.Rect(*l.bbox) * (~mat * derot)
-                                    r.normalize()
-                                    lines.append([r.x0, r.y0, r.x1, r.y1, l.text])
-                    pending = [u.to_dict() for u in build_units(ocr, ~mat)]
+                    pending, lines = _reading_of(ocr, mat, has_text, derot)
                     _cache_put(dst, f"p{pno:05d}_read", {"pending": pending, "ocr_lines": lines})
                     entries[pno] = {"units": [], "pending": pending, "swept": False}
                     ocr_lines[pno] = lines
@@ -1012,6 +1063,246 @@ def translate_pdf(
             if res.failed:
                 parts.append(f"{len(res.failed)} request(s) failed")
             res.message = ", ".join(parts) + f". Cost ${res.cost:.2f}."
+        return res
+    finally:
+        with LOCK:
+            if not doc.is_closed:
+                doc.close()
+
+
+# ---- one area of a page -----------------------------------------------------------------------------
+AREA_OCR_PX = 2200             # the OCR reads a box at about this many pixels along its longer side ...
+AREA_OCR_DPI = (200.0, 450.0)  # ... within these densities, so a small box is read enlarged
+AREA_NOTE = ("The reader marked this part of the page because text in it was missed or badly read. Look at "
+             "it closely, small print and handwriting included.")
+
+
+def _upright_to_page(region, turn: int) -> pymupdf.Matrix:
+    """Takes a point of a region's picture after it was turned upright (in points, from its top left
+    corner) back to where it is on the page."""
+    x0, y0, x1, y1 = region
+    return {0: pymupdf.Matrix(1, 0, 0, 1, x0, y0), 90: pymupdf.Matrix(0, 1, -1, 0, x1, y0),
+            180: pymupdf.Matrix(-1, 0, 0, -1, x1, y1), 270: pymupdf.Matrix(0, -1, 1, 0, x0, y1)}[turn]
+
+
+def _touch(a, b) -> bool:
+    return cover(a, b) > 0.3 or cover(b, a) > 0.3
+
+
+def estimate_area_cost(model: str, budget: Budget) -> float:
+    """About what one look at a box costs: the average of recent requests, or a guess from the prices."""
+    avg = budget.average_cost(model)
+    if avg is not None:
+        return avg
+    p = price_row(model)
+    return ((IMAGE_MAX_TOKENS * 0.6 + 2500) * p["in"] + 1200 * p["out"]) / 1e6
+
+
+def translate_area(
+    src: Path,
+    pno: int,
+    box,
+    turn: int = 0,
+    translate: bool = True,
+    model: str = DEFAULT_MODEL,
+    effort: str = DEFAULT_EFFORT,
+    glossary: str = "",
+    client=None,
+    budget: Budget | None = None,
+    engine=None,
+    replace: bool = True,
+    progress: Callable[[str], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+) -> TranslateResult:
+    """Read one boxed part of a page again, enlarged, and (with `translate`) translate what is in it.
+
+    box: [x0, y0, x1, y1] in page points as the page is displayed. turn: how far the text in the box lies
+    turned clockwise (0, 90, 180, 270); the box is turned upright before it is read.
+
+    The new reading takes the place of the blocks that lie mostly inside the box; everything else on the
+    page stays as it is. With `translate`, one request shows the box to the translator, which translates
+    the blocks the OCR read and reports text the OCR could not read (handwriting, slanted text). Without
+    it nothing is sent: blocks whose text came out the same keep their English, and the rest wait for the
+    next translation run. The result goes into the working copy, as translate_pdf's does.
+    """
+    src = Path(src)
+    dst = output_path_for(src)
+    budget = budget or Budget()
+    res = TranslateResult(dst=dst)
+    say = progress or (lambda m: None)
+    turn = _snap(turn)
+    base = dst if dst.exists() else src
+
+    def stop(reason: str, message: str) -> TranslateResult:
+        res.stopped, res.message = reason, message
+        return res
+
+    with LOCK:
+        doc = pymupdf.open(base)
+    try:
+        with LOCK:
+            if not 0 <= pno < doc.page_count:
+                return stop("page", "There is no such page.")
+            page = doc[pno]
+            prect = tuple(page.rect)
+            visible = text_kinds(page)[0]
+            has_text = page_has_text(page)
+            derot = page.derotation_matrix
+            entry = copy.deepcopy((load_translation(doc) or {"pages": {}})["pages"].get(str(pno)))
+        if visible:
+            return stop("own text", "This page has its own text, so there is nothing to read with the OCR.")
+        box = (max(prect[0], min(box[0], box[2])), max(prect[1], min(box[1], box[3])),
+               min(prect[2], max(box[0], box[2])), min(prect[3], max(box[1], box[3])))
+        if box[2] - box[0] < 4 or box[3] - box[1] < 4:
+            return stop("box", "The box is too small.")
+        if translate:
+            if budget.status().limit is None:
+                return stop("no limit", "Set a monthly API limit first (Translate > API key, limit and spending).")
+            if client is None and not have_credentials():
+                return stop("auth", "No API key is stored (Translate > API key, limit and spending).")
+        if engine is None:
+            from .ocr_engine import OcrEngine
+            engine = OcrEngine()
+        say("Loading OCR models…")
+        engine.load()
+
+        ocr_lines = None
+        if entry is None and translate:
+            # A page the file has not seen: read all of it first, so that the rest of the page waits to
+            # be translated like any other page and is not taken for finished.
+            say("Reading the page…")
+            with LOCK:
+                im, mat = render_page(doc[pno], DEFAULT_DPI)
+            entry = {"units": [], "swept": False}
+            entry["pending"], ocr_lines = _reading_of(engine.ocr_pages([im])[0], mat, has_text, derot)
+
+        # the blocks the box takes over, and the picture that is read: the box, widened to whole blocks
+        old_units = entry.get("units", []) if entry else []
+        old_pending = entry.get("pending", []) if entry else []
+        inside = lambda u: cover(u["bbox"], box) >= 0.5
+        gone = [u for u in old_units + old_pending if inside(u)]
+        region = union([box] + [u["bbox"] for u in gone])
+        region = (max(prect[0], region[0]), max(prect[1], region[1]), min(prect[2], region[2]), min(prect[3], region[3]))
+        stay = [u for u in old_units + old_pending if not inside(u)]
+        # a block that stays and hugs its print keeps its spot; one that only marks a region does not
+        page_area = (prect[2] - prect[0]) * (prect[3] - prect[1])
+        firm = [u for u in stay if not u.get("loose") and u.get("src") != "found" and not is_region(u, page_area)]
+        taken = lambda b, others: any(cover(b, q["bbox"]) > 0.5 or cover(q["bbox"], b) > 0.7 for q in others)
+        was_gone = lambda u: any(u is g for g in gone)
+
+        say("Reading the box…")
+        dpi = max(AREA_OCR_DPI[0], min(AREA_OCR_DPI[1], AREA_OCR_PX * 72.0 / max(region[2] - region[0], region[3] - region[1])))
+        with LOCK:
+            im = render_region(doc[pno], region, turn, dpi)
+        to_page = _upright_to_page(region, turn)
+        read = [turn_unit(u.to_dict(), to_page, turn)
+                for u in build_units(engine.ocr_pages([im])[0], pymupdf.Matrix(72.0 / dpi, 72.0 / dpi))]
+        read = [u for u in read if not taken(u["bbox"], firm)]
+        tmp = part_path_for(dst)
+
+        if not translate:
+            if not read:
+                return stop("empty", "The OCR found no text in the box. Nothing was changed.")
+            res.blocks = len(read)
+            if entry is None:
+                # no translation on this page: the box's text layer is simply written anew
+                with LOCK:
+                    out = pymupdf.open(base)
+                    try:
+                        refresh_layers(out[pno], [region], read)
+                        tmp.parent.mkdir(parents=True, exist_ok=True)
+                        out.save(tmp, garbage=1, deflate=True)
+                    finally:
+                        out.close()
+                res.message = f"{len(read)} block(s) of text read in the box."
+            else:
+                for u in read:
+                    was = [g for g in gone if (g.get("en") or "").strip() and _touch(g["bbox"], u["bbox"])]
+                    if (len(was) == 1 and same_text(u["ja"], was[0].get("ja") or "") >= 0.8
+                            and same_text(was[0].get("ja") or "", u["ja"]) >= 0.8):
+                        u["en"] = was[0]["en"]
+                back = [g for g in gone if not any(_touch(g["bbox"], u["bbox"]) for u in read)]
+                is_back = lambda u: any(u is g for g in back)
+                entry["units"] = [u for u in old_units if not was_gone(u) or is_back(u)] + [u for u in read if u["en"]]
+                entry["pending"] = [u for u in old_pending if not was_gone(u) or is_back(u)] + [u for u in read if not u["en"]]
+                waiting = sum(1 for u in read if not u["en"])
+                res.message = (f"{len(read)} block(s) of text read in the box"
+                               + (f"; {waiting} wait to be translated (Translate sends only those)." if waiting
+                                  else "; their English is kept."))
+                assemble(base, tmp, {pno: {"entry": {k: entry.get(k) for k in ("model", "units", "pending", "swept")},
+                                           "zone": [region] + [bx for g in gone if not is_back(g) for bx in layer_boxes(g, prect)]}}, {})
+        else:
+            if cancelled and cancelled():
+                return stop("cancelled", "Cancelled.")
+            client = client or make_client()
+            job = Job(pno, region, turn, read, [q["bbox"] for q in firm if inter(q["bbox"], region) > 0], True)
+            say("Asking the translator…")
+            with LOCK:
+                shown = render_region(doc[pno], region, turn)
+            image_b64, image_tokens = image_for_api(shown)
+            request = build_request(model, effort, glossary, image_b64, job, AREA_NOTE)
+            worst = worst_case_cost(model, input_token_bound(request, image_tokens), MAX_TOKENS)
+            try:
+                rid = budget.reserve(worst, model, f"{dst.name} p{pno + 1} box")
+            except BudgetNotSet as e:
+                return stop("no limit", str(e))
+            except BudgetExceeded as e:
+                return stop("budget", "Not sent: " + str(e))
+            try:
+                resp = call_claude(client, request, threading.Event())
+            except Exception as e:
+                kind, msg = classify_error(e)
+                if kind == "unconfirmed":
+                    budget.mark_unconfirmed(rid, msg[:120])
+                    return stop("network", "No answer came back from the API, so nothing was changed. " + msg[:200])
+                budget.release(rid)        # rejected before running: not billed
+                return stop(kind.split(":")[1] if kind.startswith("fatal") else "failed", msg[:300])
+            usage = resp.usage
+            res.cost = cost_of_usage(resp.model or model, usage)
+            budget.settle(rid, res.cost, {k: getattr(usage, k, 0) or 0 for k in
+                                          ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")})
+            paid = f" Cost ${res.cost:.2f}."
+            if resp.stop_reason == "refusal":
+                return stop("failed", "The model declined this part of the page. Nothing was changed." + paid)
+            if resp.stop_reason == "max_tokens":
+                return stop("failed", "The translation did not fit in one response; try a smaller box. Nothing was changed." + paid)
+            try:
+                result = read_response(resp, job)
+            except Exception as e:
+                return stop("failed", f"The answer could not be read ({type(e).__name__}). Nothing was changed." + paid)
+            fresh = []
+            for k, u in enumerate(read):
+                u["en"] = result["en"].get(str(k), "")
+                if u["en"].strip():
+                    fresh.append(u)
+            n_found = 0
+            for f in result["found"]:
+                if not taken(f["bbox"], firm + fresh):
+                    fresh.append(f)
+                    n_found += 1
+            if not fresh:
+                return stop("empty", "No text was found in the box. Nothing was changed." + paid)
+            back = [g for g in gone if not any(_touch(g["bbox"], u["bbox"]) for u in fresh)]
+            is_back = lambda u: any(u is g for g in back)
+            entry["units"] = [u for u in old_units if not was_gone(u) or is_back(u)] + fresh
+            entry["pending"] = [u for u in old_pending if not was_gone(u) or is_back(u)]
+            entry["model"] = resp.model or model
+            res.translated, res.blocks, res.found = 1, len(fresh) - n_found, n_found
+            res.message = (f"{res.blocks} block(s) translated in the box"
+                           + (f", {n_found} more found that the OCR could not read" if n_found else "") + "." + paid)
+            say("Writing the PDF…")
+            assemble(base, tmp, {pno: {"entry": {k: entry.get(k) for k in ("model", "units", "pending", "swept")},
+                                       "zone": [region] + [bx for g in gone if not is_back(g) for bx in layer_boxes(g, prect)],
+                                       "ocr_lines": ocr_lines}},
+                     {"model": model})
+        _cache_forget(dst, pno)
+        if replace:
+            with LOCK:
+                doc.close()
+                os.replace(tmp, dst)
+            res.output = dst
+        else:
+            res.output = tmp
         return res
     finally:
         with LOCK:

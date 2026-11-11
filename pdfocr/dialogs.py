@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pymupdf
 from PySide6.QtCore import QSettings, QSize, Qt, QTimer
-from PySide6.QtGui import QIcon, QImageReader, QPixmap
+from PySide6.QtGui import QIcon, QImage, QImageReader, QPixmap, QTransform
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
@@ -309,6 +309,70 @@ class ImagesDialog(QDialog):
             self.worker.cancel()
             self.worker.wait(5000)
         super().reject()
+
+
+# ---- a box whose text lies on its side ---------------------------------------------------------------
+class AreaDialog(QDialog):
+    """Turn a preview of a dragged box until its text reads the right way up, then choose what to do.
+    `turn` (how far the text lies turned clockwise on the page) and `action` ("translate" or "ocr")
+    hold the answer."""
+
+    def __init__(self, parent, image: QImage, cost_text: str = "", can_translate: bool = True):
+        super().__init__(parent)
+        self.setWindowTitle("Text that lies on its side")
+        self.turn, self.action = 0, ""
+        self._image = image
+        self.preview = QLabel()
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setFixedSize(560, 420)
+        self.preview.setStyleSheet("background: #3c3c3c;")
+        b_left = QPushButton("Turn left")
+        b_right = QPushButton("Turn right")
+        b_left.clicked.connect(lambda: self._turn_by(90))     # the picture turns left when the text lies turned right
+        b_right.clicked.connect(lambda: self._turn_by(-90))
+        turns = QHBoxLayout()
+        turns.addStretch(1)
+        turns.addWidget(b_left)
+        turns.addWidget(b_right)
+        turns.addStretch(1)
+        note = QLabel("Turn the picture until the text reads the right way up. The page itself is not turned: "
+                      "the English is set along the text as it lies on the page.")
+        note.setWordWrap(True)
+        b_tr = QPushButton("Translate" + (f" ({cost_text})" if cost_text else ""))
+        b_tr.setDefault(can_translate)
+        b_tr.setEnabled(can_translate)
+        if not can_translate:
+            b_tr.setToolTip("Needs an API key and a monthly limit (Translate > API key, limit and spending).")
+        b_ocr = QPushButton("Read only (OCR, free)")
+        b_cancel = QPushButton("Cancel")
+        b_tr.clicked.connect(lambda: self._choose("translate"))
+        b_ocr.clicked.connect(lambda: self._choose("ocr"))
+        b_cancel.clicked.connect(self.reject)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        for b in (b_tr, b_ocr, b_cancel):
+            buttons.addWidget(b)
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.preview)
+        lay.addLayout(turns)
+        lay.addWidget(note)
+        lay.addLayout(buttons)
+        self._show()
+
+    def _turn_by(self, degrees: int):
+        self.turn = (self.turn + degrees) % 360
+        self._show()
+
+    def _show(self):
+        pm = QPixmap.fromImage(self._image)
+        if self.turn:
+            pm = pm.transformed(QTransform().rotate(-self.turn), Qt.TransformationMode.SmoothTransformation)
+        self.preview.setPixmap(pm.scaled(self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                                         Qt.TransformationMode.SmoothTransformation))
+
+    def _choose(self, action: str):
+        self.action = action
+        self.accept()
 
 
 # ---- translation settings and spending --------------------------------------------------------------

@@ -201,6 +201,34 @@ class ImagesToPdfWorker(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
+class AreaWorker(QThread):
+    """Read one boxed part of a page again and, when asked, translate it. The result is left in a temp
+    file for the window to swap in, because the destination may be the document that is open."""
+    progress = Signal(str)
+    done = Signal(object)      # translate.TranslateResult
+    failed = Signal(str)
+
+    def __init__(self, src: Path, page: int, box, turn: int, translate: bool, model: str, effort: str,
+                 glossary: str, budget=None):
+        super().__init__()
+        self.src, self.page, self.box, self.turn, self.translate = Path(src), page, tuple(box), turn, translate
+        self.model, self.effort, self.glossary, self.budget = model, effort, glossary, budget
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        from .translate import translate_area
+        try:
+            res = translate_area(self.src, self.page, self.box, self.turn, self.translate, self.model, self.effort,
+                                 self.glossary, budget=self.budget, engine=shared_engine(), replace=False,
+                                 progress=self.progress.emit, cancelled=lambda: self._cancel)
+            self.done.emit(res)
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
 class TranslateWorker(QThread):
     """Translate pages of a PDF with Claude. The result is left in a temp file for the window to swap in,
     because the destination may be the document that is open."""

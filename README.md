@@ -10,6 +10,8 @@ RPG and wargame rulebooks: pages where Tesseract misses the stippled headings an
   model, and writes an invisible text layer into a copy (`<name> (OCR).pdf`). The original is never touched.
 - Search within a document with highlighted hits, or across every book in the library (SQLite FTS5).
 - Select and copy text, or drag a box to copy any region of a page as a 300 dpi image.
+- **Point at what was missed**: drag a box around part of a page and have just that part read again,
+  enlarged, and translated.
 - **New PDF from images**: turn a folder of page scans into a PDF, losslessly.
 - **Rotate pages** that were scanned sideways, and read them again the right way up.
 - **Japanese**: OCR reads Japanese, horizontal and vertical, into a searchable layer.
@@ -70,7 +72,8 @@ a new `ICON_NAME` in `make_icon.py` and run `register.py` again, or the old icon
   follows the invisible text layer, so word boundaries are approximate.
 - **Select area** (A): drag a box on a page and it is copied to the clipboard as a 300 dpi image the
   moment you let go (paste into anything that takes images). Right-click the box for *Save image as…*,
-  *Copy text in box* or *Clear box*; Ctrl+C copies the image again; Esc clears it.
+  *Copy text in box* or *Clear box*; Ctrl+C copies the image again; Esc clears it. A row of buttons under
+  the box reads or translates what is in it (see *One part of a page* under Translating).
 - **Search (Ctrl+F, F3 / Shift+F3)**: finds every occurrence in the open document, lists them with context,
   highlights them on the page. Pressing Enter again on the same text steps to the next hit (wrapping);
   changing the text starts a fresh search. "All books in library" searches every indexed PDF instead;
@@ -149,6 +152,28 @@ translator once with everything already handled marked off, and it reports any o
 where it is, how it slopes, what it says, and the translation. Those pieces become labels on the page.
 This is one extra request per page (several for a very large page), made once; the dialog counts them
 in its estimate. Its boxes are placed by eye and are less exact than the OCR's.
+
+**One part of a page.** When a caption, a note or a whole corner of a page was missed or read badly,
+choose **Select area** (A) and drag a box around it. Three buttons appear under the box (they are also on
+the box's right-click menu, and in the `Translate` and `Page` menus):
+
+- **Translate box** reads what is in the box again with the OCR, enlarged (a small box is read at up to
+  450 dpi, so small print comes out far better than in a whole-page pass), and sends that one picture to
+  the translator, which translates the blocks and also reports handwriting and slanted text the OCR
+  cannot read. One request, under the same spending limit as everything else; the button shows about what
+  it costs.
+- **Read box (OCR)** does the reading only. It is free and nothing is sent. Blocks whose text comes out
+  the same keep their English; blocks that are new wait for the next translation run.
+- **Sideways…** is for text that lies on its side or upside down in the box. It shows the box, you turn
+  the picture until the text reads the right way up, and then translate or read it. The page itself is not
+  turned: the English is set along the text as it lies on the page.
+
+The new reading takes the place of the blocks that lie mostly inside the box (a block the box cuts
+through is read whole); everything else on the page stays exactly as it is, and the text layer is
+rewritten only where the box was. If nothing is found in the box, nothing is changed. The view stays
+where it was, so several spots on a page can be done one after another. On a page that has not been
+translated yet, *Translate box* reads the whole page first, so the rest of it still counts as waiting
+for the normal Translate run.
 
 A glossary box lets you name the book and fix how names and terms are spelled; it is sent with every
 page so the translation stays consistent.

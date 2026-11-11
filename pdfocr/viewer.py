@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QObject, QRectF, QRunnable, Qt, QThreadPool, Signal, QSize, QTimer
+from PySide6.QtCore import QObject, QPoint, QRectF, QRunnable, Qt, QThreadPool, Signal, QSize, QTimer
 from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPen, QPixmap, QPainter, QTextOption
 from PySide6.QtWidgets import (QApplication, QFileDialog, QGraphicsItem, QGraphicsPixmapItem, QGraphicsRectItem,
                                QGraphicsScene, QGraphicsTextItem, QGraphicsView, QListWidget, QListWidgetItem,
-                               QAbstractItemView, QMenu)
+                               QAbstractItemView, QFrame, QHBoxLayout, QMenu, QToolButton)
 import pymupdf
 
 from .pdflock import LOCK
@@ -84,6 +84,7 @@ class PdfView(QGraphicsView):
     area_saved = Signal(str)         # snapshot image saved to this path
     rotate_requested = Signal(int, int)   # page, degrees clockwise (from the right-click menu)
     reread_requested = Signal(int)        # page to OCR again
+    area_action = Signal(int, object, str)   # page, box (x0, y0, x1, y1) in page points, "translate" | "ocr" | "ask"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -103,6 +104,7 @@ class PdfView(QGraphicsView):
         self._area_anchor: tuple[int, float, float] | None = None   # page, x, y (page points)
         self._area: tuple[int, pymupdf.Rect] | None = None           # finished box
         self._area_item: QGraphicsRectItem | None = None
+        self._area_bar = self._make_area_bar()   # the buttons shown under a finished box
         # middle-click autoscroll (Windows style): click to start, move away from the anchor to scroll,
         # faster the farther you go; click again (or release after a drag) to stop
         self._auto_anchor = None            # QPointF in viewport coords while autoscrolling
@@ -146,6 +148,7 @@ class PdfView(QGraphicsView):
         self.rendered, self.pending = {}, set()
         self._words, self._selection, self._sel_items, self._anchor = {}, [], [], None
         self._area, self._area_item, self._area_anchor = None, None, None
+        self._area_bar.hide()
         self._translation, self._overlay_items, self._unit_colors = {}, {}, {}
         self.doc, self.doc_path = doc, path
         if doc is None:
@@ -564,6 +567,18 @@ class PdfView(QGraphicsView):
         if self.fit_mode:
             self._reapply_fit()
         self._render_timer.start()
+        self._place_area_bar()
+
+    def scrollContentsBy(self, dx: int, dy: int):
+        super().scrollContentsBy(dx, dy)
+        self._place_area_bar()
+
+    def restore_view(self, zoom: float, fit: str | None, h: int, v: int):
+        """Back to a zoom and a scroll position, after the document was loaded again."""
+        self.set_zoom(zoom, fit)
+        self.horizontalScrollBar().setValue(h)
+        self.verticalScrollBar().setValue(v)
+        self._render_timer.start()
 
     # ---- navigation ---------------------------------------------------------------
     def current_page(self) -> int:
@@ -770,6 +785,7 @@ class PdfView(QGraphicsView):
             self.scene().removeItem(self._area_item)
             self._area_item = None
         if self._area is None or not self.page_rects:
+            self._place_area_bar()
             return
         page, r = self._area
         pr = self.page_rects[page]
@@ -782,6 +798,79 @@ class PdfView(QGraphicsView):
         it.setZValue(7)
         self.scene().addItem(it)
         self._area_item = it
+        self._place_area_bar()
+
+    def _make_area_bar(self) -> QFrame:
+        """The small row of buttons that sits under a dragged box: translate what is in it, or read it
+        again with the OCR."""
+        bar = QFrame(self)
+        bar.setObjectName("areaBar")
+        bar.setStyleSheet("#areaBar { background: #fdfdfd; border: 1px solid #5a7fd0; border-radius: 4px; }"
+                          " QToolButton { border: none; padding: 3px 9px; color: #1a1a1a; }"
+                          " QToolButton:hover { background: #dce6fb; }")
+        bar.setCursor(Qt.CursorShape.ArrowCursor)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(0)
+        self._area_buttons: dict[str, QToolButton] = {}
+        for key, text, tip in (
+                ("translate", "Translate box", "Read what is in the box again, enlarged, and translate it. Also finds "
+                                               "handwriting and slanted text the OCR cannot read. One request."),
+                ("ocr", "Read box (OCR)", "Read what is in the box again with the OCR, enlarged. Free; nothing is sent."),
+                ("ask", "Sideways…", "For text that lies on its side or upside down: turn a preview of the box "
+                                     "upright first, then translate or read it.")):
+            b = QToolButton(bar)
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.clicked.connect(lambda _=False, k=key: self._emit_area(k))
+            lay.addWidget(b)
+            self._area_buttons[key] = b
+        bar.hide()
+        return bar
+
+    def set_area_cost(self, text: str):
+        """What the Translate button says a look at a box costs, e.g. "about 4¢" ("" for nothing)."""
+        self._area_buttons["translate"].setText("Translate box" + (f" ({text})" if text else ""))
+        self._place_area_bar()
+
+    def area_box(self) -> tuple[int, tuple[float, float, float, float]] | None:
+        """The finished box: (page, (x0, y0, x1, y1) in page points as displayed)."""
+        if not self.has_area():
+            return None
+        page, r = self._area
+        return page, (r.x0, r.y0, r.x1, r.y1)
+
+    def _emit_area(self, action: str):
+        sel = self.area_box()
+        if sel is not None:
+            self.area_action.emit(sel[0], sel[1], action)
+
+    def _place_area_bar(self):
+        """Keep the buttons just under the box (above it, or inside it, where there is no room below)."""
+        bar = self._area_bar
+        if self._area_anchor is not None or not self.has_area() or not self.page_rects:
+            bar.hide()
+            return
+        page, r = self._area
+        pr = self.page_rects[page]
+        box = self.mapFromScene(QRectF(pr.x() + r.x0 * self.zoom, pr.y() + r.y0 * self.zoom,
+                                       r.width * self.zoom, r.height * self.zoom)).boundingRect()
+        vp = self.viewport()
+        if not box.intersects(vp.rect()):
+            bar.hide()
+            return
+        bar.adjustSize()
+        w, h = bar.width(), bar.height()
+        x = max(4, min(box.right() - w, vp.width() - w - 4))
+        y = box.bottom() + 6
+        if y + h > vp.height() - 4:
+            y = box.top() - h - 6
+        if y < 4:
+            y = max(4, min(box.bottom() - h - 6, vp.height() - h - 4))
+        bar.move(vp.mapTo(self, QPoint(int(x), int(y))))
+        bar.show()
+        bar.raise_()
 
     def clear_area(self):
         self._area, self._area_anchor = None, None
@@ -966,6 +1055,7 @@ class PdfView(QGraphicsView):
                 self.copy_area_image()   # a finished box goes straight to the clipboard
             else:
                 self.clear_area()
+            self._place_area_bar()
             e.accept()
             return
         super().mouseReleaseEvent(e)
@@ -1011,6 +1101,10 @@ class PdfView(QGraphicsView):
             return
         menu = QMenu(self)
         if self.has_area():
+            menu.addAction(self._area_buttons["translate"].text(), lambda: self._emit_area("translate"))
+            menu.addAction("Read box again (OCR)", lambda: self._emit_area("ocr"))
+            menu.addAction("Text in the box is sideways…", lambda: self._emit_area("ask"))
+            menu.addSeparator()
             menu.addAction("Copy image", self.copy_area_image)
             menu.addAction("Save image as…", self.save_area_image)
             a_at = menu.addAction("Copy text in box", self.copy_area_text)

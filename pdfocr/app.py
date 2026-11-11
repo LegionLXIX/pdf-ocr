@@ -16,14 +16,14 @@ from PySide6.QtWidgets import (QApplication, QDialog, QDockWidget, QFileDialog, 
 
 from . import translate as tr
 from .budget import Budget
-from .dialogs import ImagesDialog, RotateDialog, TranslateDialog, TranslateSettingsDialog
+from .dialogs import AreaDialog, ImagesDialog, RotateDialog, TranslateDialog, TranslateSettingsDialog
 from .library import Library, LibraryHit
 from .pages import rotate_pages
 from .pdf_ocr import output_path_for, pages_needing_ocr, text_kinds
 from .pdflock import LOCK
 from .results import HEADER_ROLE, PAGE_ROLE, SNIPPET_ROLE, ResultDelegate
 from .viewer import PdfView, ThumbnailList
-from .workers import DocSearchWorker, IndexWorker, OcrWorker
+from .workers import AreaWorker, DocSearchWorker, IndexWorker, OcrWorker
 
 APP_NAME = "PDF OCR"
 APP_ID = "PDFOCR.App"  # AppUserModelID: taskbar shows our icon, not Python's (must match register.py)
@@ -132,6 +132,7 @@ class MainWindow(QMainWindow):
         self.view.area_saved.connect(lambda p: self.statusBar().showMessage(f"Saved {p}", 6000))
         self.view.rotate_requested.connect(lambda page, deg: self.rotate([page], deg))
         self.view.reread_requested.connect(lambda page: self.reread_pages([page]))
+        self.view.area_action.connect(self.read_area)
 
         self.thumbs = ThumbnailList()
         self.thumbs.currentRowChanged.connect(self._on_thumb_clicked)
@@ -252,7 +253,8 @@ class MainWindow(QMainWindow):
         self.a_select.setToolTip("Drag to select text; Ctrl+C copies (T)")
         self.a_select.setShortcut("T")
         self.a_area = QAction("Select area", self, checkable=True)
-        self.a_area.setToolTip("Drag a box; it is copied as an image. Right-click the box for more (A)")
+        self.a_area.setToolTip("Drag a box around part of a page, then use the buttons under it to translate what "
+                               "is in it or read it again with the OCR. The box is also copied as an image (A)")
         self.a_area.setShortcut("A")
         self.a_hand = QAction("Hand", self, checkable=True)
         self.a_hand.setToolTip("Drag to pan (H)")
@@ -318,6 +320,7 @@ class MainWindow(QMainWindow):
         m_page.addAction("Rotate &several pages…", self.rotate_range)
         m_page.addSeparator()
         m_page.addAction("Read this page &again (OCR)", lambda: self.reread_pages(None))
+        m_page.addAction("Read the selected &box again (OCR)", lambda: self.read_area(action="ocr"))
 
         m_lib = self.menuBar().addMenu("&Library")
         m_lib.addAction("&Add folder to library…", self.add_folder)
@@ -328,6 +331,7 @@ class MainWindow(QMainWindow):
 
         m_tr = self.menuBar().addMenu("&Translate")
         m_tr.addAction("&Translate to English…", self.translate_current)
+        m_tr.addAction("Translate the selected &box", lambda: self.read_area(action="translate"))
         m_tr.addAction(self.a_english)
         self.a_boxes = QAction("Show the English in plain &boxes", self, checkable=True)
         self.a_boxes.setToolTip("Off: the English replaces the Japanese on the page. "
@@ -355,7 +359,9 @@ class MainWindow(QMainWindow):
         if path:
             self.open_pdf(path)
 
-    def open_pdf(self, path: str, page: int = 0, search: str = ""):
+    def open_pdf(self, path: str, page: int = 0, search: str = "", view: tuple | None = None):
+        """view: (zoom, fit mode, horizontal scroll, vertical scroll) to come back to, for a document that
+        is loaded again after a change; otherwise the document opens at `page`, fitted to the window."""
         p = Path(path)
         if not p.exists():
             QMessageBox.warning(self, APP_NAME, f"File not found:\n{p}")
@@ -395,14 +401,18 @@ class MainWindow(QMainWindow):
         self.a_english.setChecked(has_en and self.settings.value("show_english", True, type=bool))
         self.a_english.blockSignals(False)
         self.view.set_show_english(self.a_english.isChecked())
+        self.view.set_area_cost(self._area_cost_text())
         self.page_spin.setRange(1, doc.page_count)
         self.page_total.setText(f" / {doc.page_count} ")
         self.hits, self.current_hit = [], -1
         self.search.results.clear()
         self.search.count.setText("")
-        QTimer.singleShot(0, self.view.fit_page)   # whole page visible by default; Fit width is a click away
-        if page:
-            QTimer.singleShot(50, lambda: self.view.go_to_page(page))
+        if view is not None:
+            QTimer.singleShot(0, lambda: self.view.restore_view(*view))
+        else:
+            QTimer.singleShot(0, self.view.fit_page)   # whole page visible by default; Fit width is a click away
+            if page:
+                QTimer.singleShot(50, lambda: self.view.go_to_page(page))
         self.view.setFocus()   # arrow keys page through the document right away
         self.info_btn.setText("Make searchable (OCR)")
         self._info_action = self.ocr_current
@@ -780,6 +790,74 @@ class MainWindow(QMainWindow):
         self.open_pdf(str(dst), page=page)
         QMessageBox.information(self, APP_NAME, res.message + (
             "\n\n" + "\n".join(f"Page {p + 1}: {why}" for p, why in res.failed[:12]) if res.failed else ""))
+
+    # ---- one boxed part of a page ---------------------------------------------------
+    def _area_cost_text(self) -> str:
+        """About what translating one box costs, for the button under the box ("" when nothing can be sent)."""
+        if not tr.have_credentials() or self.budget.status().limit is None:
+            return ""
+        cost = tr.estimate_area_cost(self.settings.value("tr_model", tr.DEFAULT_MODEL), self.budget)
+        return f"about {max(1, round(cost * 100))}¢"
+
+    def read_area(self, page: int | None = None, box=None, action: str = "translate"):
+        """Read the box the user dragged again, enlarged, and translate it (action "translate"), or only
+        read it with the OCR ("ocr"); "ask" first shows the box so that sideways text can be turned upright."""
+        if not self.doc:
+            return
+        if page is None:
+            sel = self.view.area_box()
+            if sel is None:
+                QMessageBox.information(self, APP_NAME, "Choose “Select area” on the toolbar (A) and drag a box "
+                                                        "around the text first.")
+                return
+            page, box = sel
+        can_send = tr.have_credentials() and self.budget.status().limit is not None
+        turn = 0
+        if action == "ask":
+            # a small box is shown enlarged, so that it can be seen which way its text reads
+            dpi = int(max(150, min(400, 1100 * 72 / max(box[2] - box[0], box[3] - box[1], 1))))
+            dlg = AreaDialog(self, self.view.area_image(dpi), self._area_cost_text(), can_send)
+            if not dlg.exec() or not dlg.action:
+                return
+            turn, action = dlg.turn, dlg.action
+        translate = action == "translate"
+        if translate and not can_send:
+            QMessageBox.information(self, APP_NAME, "Translating needs an API key and a monthly limit.\n"
+                                                    "Set them under Translate > API key, limit and spending.")
+            return
+        if self.ocr_worker and self.ocr_worker.isRunning():
+            QMessageBox.information(self, APP_NAME, "An OCR job is already running.")
+            return
+        prog = ProgressDialog("Translate box" if translate else "Read box (OCR)", self)
+        worker = AreaWorker(Path(self.doc_path), page, box, turn, translate,
+                            self.settings.value("tr_model", tr.DEFAULT_MODEL),
+                            self.settings.value("tr_effort", tr.DEFAULT_EFFORT),
+                            self.settings.value("tr_glossary", "") or "", self.budget)
+        got: dict = {}
+        worker.progress.connect(lambda m: prog.update(0, 0, m))
+        worker.done.connect(lambda r: (got.update(res=r), prog.accept()))
+        worker.failed.connect(lambda m: (got.update(err=m), prog.accept()))
+        prog.cancel_btn.clicked.connect(lambda: (worker.cancel(), prog.label.setText("Stopping…")))
+        worker.start()
+        prog.exec()
+        worker.wait()
+        self.view.set_area_cost(self._area_cost_text())
+        if "err" in got:
+            QMessageBox.warning(self, APP_NAME, f"That did not work:\n{got['err']}")
+            return
+        res = got.get("res")
+        if res is None:
+            return
+        if res.output is None:          # nothing was changed; say why
+            QMessageBox.information(self, APP_NAME, res.message)
+            return
+        where = (self.view.zoom, self.view.fit_mode, self.view.horizontalScrollBar().value(),
+                 self.view.verticalScrollBar().value())
+        dst, out = Path(res.dst), Path(res.output)
+        if out != dst and not self._swap_in(out, dst):
+            return
+        self.open_pdf(str(dst), page=page, view=where)
+        self.statusBar().showMessage(res.message, 15000)
 
     def closeEvent(self, e):
         for w in (self.search_worker, self.ocr_worker, self.index_worker):
